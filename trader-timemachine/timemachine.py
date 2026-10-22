@@ -102,6 +102,9 @@ NYSE_EARLY_CLOSE = {  # 1:00 p.m. ET, from https://www.nyse.com/markets/hours-ca
     "2027-11-26": "day after Thanksgiving",
 }
 EARLY_MIN = 13 * 60
+SLIPPAGE_BPS = 2.0   # default slippage a side, in basis points of the entry: a liquid stock, a market order
+COMMISSION = 0.0     # default commission a share, each side (Alpaca: 0; IBKR Pro fixed: about 0.005)
+MIN_TRADES = 30      # the backtest gives no verdict below this many trades
 
 
 class TMError(Exception):
@@ -346,11 +349,29 @@ def pct(a, q):
     return a[min(len(a) - 1, int(q * len(a)))]
 
 
-def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy"):
-    """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py."""
+def cost_r(entry, risk, costs):
+    """The round trip's costs in R: slippage on the way in and on the way out
+    (bps of the entry, each side) plus the commission per share, each side."""
+    if not costs:
+        return 0.0
+    per_share = 2 * entry * costs.get("slippage_bps", 0) / 10000.0 + 2 * costs.get("commission_per_share", 0)
+    return per_share / risk
+
+
+def stop_fill(stop, bar_open, long):
+    """Where a stop really fills: at the stop, or at the open when the bar gaps through it."""
+    return min(stop, bar_open) if long else max(stop, bar_open)
+
+
+def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=2, side="buy", costs=None):
+    """Monte Carlo replays of bars k+1..last. Same draws and order as the reel's sim.py.
+    The odds and avg_R are the reel's (fills at the stop and the target). avg_R_net
+    also fills a stop at the bar's open when the bar gaps through it, and takes
+    off the costs (cost_r)."""
     long = side == "buy"
     risk = (entry - stop) if long else (stop - entry)
     r_target = round(((target - entry) if long else (entry - target)) / risk, 4)
+    stop_R = []   # the real R of each stop outcome, gap included
 
     def slot(rng, i):
         return i if window == 0 else min(SESSION_BARS - 1, max(1, i + rng.randint(-window, window)))
@@ -377,6 +398,9 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
                         outcome = "stop"
                     elif lo <= target:
                         outcome = "target"
+                if outcome == "stop":
+                    f = stop_fill(stop, p * o, long)
+                    stop_R.append(((f - entry) if long else (entry - f)) / risk)
             p = cl
             if keep:
                 path.append(round(p, 2))
@@ -389,6 +413,9 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
                 if o == "target" or (o == "close" and (p > entry if long else p < entry)))
     Rs = [r_target if o == "target" else -1.0 if o == "stop" else ((p - entry) if long else (entry - p)) / risk
           for o, p in zip(outcomes, closes)]
+    gaps = iter(stop_R)
+    c_r = cost_r(entry, risk, costs)
+    Rs_net = [(next(gaps) if o == "stop" else R) - c_r for o, R in zip(outcomes, Rs)]
     srt = sorted(closes)
     # percentile bands per bar for the fan chart: a second run of 2,000 paths, same seed
     rng = random.Random(seed)
@@ -419,6 +446,7 @@ def simulate(pool, entry, stop, target, k, last, replays=10000, seed=19, window=
         "p_neither": round(cnt["close"] / replays, 4), "p_green": round(green / replays, 4),
         "median_close": round(pct(srt, 0.5), 2), "p5_close": round(pct(srt, 0.05), 2),
         "p95_close": round(pct(srt, 0.95), 2), "avg_R": round(statistics.mean(Rs), 3),
+        "avg_R_net": round(statistics.mean(Rs_net), 3), "cost_R": round(c_r, 4), "costs": dict(costs or {}),
         "r_at_target": r_target, "band_paths": BAND_PATHS, "bands": bands, "sample_paths": paths,
         "hist": {"lo": round(lo_, 2), "hi": round(hi_, 2), "bins": bins},
     }
@@ -448,10 +476,11 @@ def rule_stop(rule, oh, ol, entry, long):
     return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
 
 
-def history_replay(sessions, rule, last, side="buy"):
+def history_replay(sessions, rule, last, side="buy", costs=None):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
-    target, bar by bar, else the close at --until."""
+    target, bar by bar, else the close at --until. R_net fills a stop at the open
+    of a bar that gaps through it and takes off the costs."""
     long = side == "buy"
     n = rule["or_minutes"] // 5
     trades = []
@@ -466,10 +495,12 @@ def history_replay(sessions, rule, last, side="buy"):
         if risk <= 0:
             continue
         t = round(e + rule["target_r"] * risk, 2) if long else round(e - rule["target_r"] * risk, 2)
-        oc = None
+        oc, R_stop = None, -1.0
         for b in D[kk + 1:last + 1]:
             if (b["l"] <= s) if long else (b["h"] >= s):
                 oc = "stop"
+                f = stop_fill(s, b["o"], long)
+                R_stop = ((f - e) if long else (e - f)) / risk
                 break
             if (b["h"] >= t) if long else (b["l"] <= t):
                 oc = "target"
@@ -477,8 +508,10 @@ def history_replay(sessions, rule, last, side="buy"):
         cl = D[last]["c"]
         R = ((t - e) if long else (e - t)) / risk if oc == "target" else -1.0 if oc == "stop" else \
             ((cl - e) if long else (e - cl)) / risk
+        R_net = (R_stop if oc == "stop" else R) - cost_r(e, risk, costs)
         trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
-                       "outcome": oc or "close", "R": round(R, 2)})
+                       "outcome": oc or "close", "R": round(R, 2), "R_net": round(R_net, 2),
+                       "gapped": oc == "stop" and R_stop < -1.0})
     return {
         "sessions": len(sessions), "triggered": len(trades),
         "target": sum(1 for x in trades if x["outcome"] == "target"),
@@ -486,6 +519,7 @@ def history_replay(sessions, rule, last, side="buy"):
         "close": sum(1 for x in trades if x["outcome"] == "close"),
         "green": sum(1 for x in trades if x["R"] > 0),
         "avg_R": round(statistics.mean(x["R"] for x in trades), 3) if trades else None,
+        "avg_R_net": round(statistics.mean(x["R_net"] for x in trades), 3) if trades else None,
         "rule": rule, "trades": trades,
     }
 
@@ -676,7 +710,7 @@ def verdict_notes(mc):
     return notes
 
 
-def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo"):
+def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=None, source="yahoo", costs=None):
     """Chart JSON text + a normalized plan -> the timemachine.json document."""
     if not 1 <= replays <= 1000000:
         raise TMError("--replays must be between 1 and 1,000,000")
@@ -721,7 +755,8 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         raise TMError("only %d full session(s) of %s before %s in the data; the time machine needs at least %d"
                       % (len(sessions), sym, plan["date"], MIN_SESSIONS))
     pool = build_pool(sessions)
-    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"])
+    mc = simulate(pool, plan["entry"], plan["stop"], plan["target"], k, last, replays, seed, window, plan["side"],
+                  costs)
     mc = dict(mc, until=clock24(until_min), pool_sessions=len(sessions), pool_from=sessions[0][0],
               pool_to=sessions[-1][0],
               band_times=[clock24(OPEN_MIN + 5 * (j + 1)) for j in range(k, last + 1)])
@@ -729,7 +764,7 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
     plan_out = {kk: v for kk, v in plan.items() if v is not None}
     if rule:
         plan_out["stop_rule"] = rule["stop_rule"]
-        history = history_replay(sessions, rule, last, plan["side"])
+        history = history_replay(sessions, rule, last, plan["side"], costs)
     else:
         history = {"sessions": len(sessions), "triggered": 0, "rule": None, "trades": [],
                    "note": "skipped: the history replay knows the opening-range breakout (orb) only, "
@@ -751,6 +786,162 @@ def time_machine(text, plan, now_utc, replays=10000, seed=19, window=2, until=No
         "note": ("A simulation built from %s's own last %d full sessions. It is not a prediction: earnings, "
                  "news and halts can do things those sessions never did. Same seed, same numbers." % (sym, len(sessions))),
     }
+
+
+# ---------------------------------------------------------------- costs
+
+def load_costs(a):
+    """Slippage and commission: the flags, else trader/config.json
+    (slippage_bps, commission_per_share), else the defaults above."""
+    cfg = {}
+    path = getattr(a, "config", None) or "trader/config.json"
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except ValueError as e:
+            raise TMError("%s is not valid JSON: %s" % (path, e))
+        if not isinstance(cfg, dict):
+            cfg = {}
+    out = {}
+    for key, flag, default in (("slippage_bps", "slippage_bps", SLIPPAGE_BPS),
+                               ("commission_per_share", "commission", COMMISSION)):
+        v = getattr(a, flag, None)
+        if v is None:
+            v = cfg.get(key, default)
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            raise TMError("%s must be a number, got %r" % (key, v))
+        if not 0 <= v < 1000 or math.isnan(v):
+            raise TMError("%s must be zero or more, got %r" % (key, v))
+        out[key] = v
+    return out
+
+
+def cost_words(costs):
+    return "slippage %g bps a side, commission $%g a share a side" % (
+        costs.get("slippage_bps", 0), costs.get("commission_per_share", 0))
+
+
+# ---------------------------------------------------------------- backtest
+
+def backtest(charts, rule, now_utc, until=None, costs=None, side="buy"):
+    """{SYM: chart JSON text} + an orb rule -> the backtest document. The rule runs on
+    every full session in each chart (today too, once it is complete): the same
+    history replay the run uses, with the costs."""
+    until_min = CLOSE_MIN if until is None else parse_clock(until, "--until")
+    if (until_min - OPEN_MIN) % 5 or until_min > CLOSE_MIN:
+        raise TMError("--until must be on the 5-minute grid and no later than 4:00 PM")
+    last = (until_min - OPEN_MIN) // 5 - 1
+    if last < rule["or_minutes"] // 5:
+        raise TMError("--until %s ends before the opening range does" % clock12(until_min))
+    per, trades, failed = [], [], {}
+    for sym in sorted(charts):
+        try:
+            meta, bars, _ = parse_bars(chart_result(charts[sym], sym), now_utc)
+        except TMError as e:
+            failed[sym] = str(e)
+            continue
+        sessions, _ = full_sessions(split_sessions(bars), "9999-12-31")
+        h = history_replay(sessions, rule, last, side, costs)
+        for t in h["trades"]:
+            trades.append(dict(t, symbol=sym))
+        per.append({"symbol": sym, "sessions": h["sessions"], "triggered": h["triggered"],
+                    "target": h["target"], "stop": h["stop"], "close": h["close"],
+                    "avg_R": h["avg_R"], "avg_R_net": h["avg_R_net"]})
+    trades.sort(key=lambda t: (t["date"], t["time"], t["symbol"]))
+    return {
+        "created_by": "trader-timemachine backtest",
+        "created_at": now_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "rule": rule, "until": clock24(until_min), "costs": dict(costs or {}),
+        "symbols": per, "failed": failed, "stats": backtest_stats(trades), "trades": trades,
+    }
+
+
+def backtest_stats(trades):
+    """Pooled numbers over every trade, after costs: win rate, average R with a 95 %
+    range for the true average (1.96 standard errors), profit factor, worst drawdown
+    in R (trades in date order), and the verdict."""
+    n = len(trades)
+    st = {"trades": n}
+    if not n:
+        st["verdict"] = "The rule never fired: nothing to judge."
+        return st
+    net = [t["R_net"] for t in trades]
+    avg = statistics.mean(net)
+    sd = statistics.stdev(net) if n > 1 else 0.0
+    half = 1.96 * sd / math.sqrt(n)
+    wins, losses = sum(r for r in net if r > 0), -sum(r for r in net if r < 0)
+    eq = peak = dd = 0.0
+    for r in net:
+        eq += r
+        peak = max(peak, eq)
+        dd = max(dd, peak - eq)
+    st.update({
+        "win_rate": round(sum(1 for r in net if r > 0) / n, 4),
+        "avg_R": round(statistics.mean(t["R"] for t in trades), 3),
+        "avg_R_net": round(avg, 3), "ci95_net": [round(avg - half, 3), round(avg + half, 3)],
+        "profit_factor_net": round(wins / losses, 2) if losses else None,
+        "total_R_net": round(sum(net), 2), "max_drawdown_R": round(dd, 2),
+        "gap_stops": sum(1 for t in trades if t.get("gapped")),
+    })
+    lo, hi = st["ci95_net"]
+    if n < MIN_TRADES:
+        st["verdict"] = ("Too few trades to tell: %d, and it takes at least %d before the average means much."
+                         % (n, MIN_TRADES))
+    elif lo > 0:
+        st["verdict"] = ("An edge after costs: %+.3f R a trade, and the 95 %% range (%+.3f to %+.3f) stays above "
+                         "zero. Past data only: it can stop working." % (avg, lo, hi))
+    elif hi < 0:
+        st["verdict"] = ("Loses after costs: %+.3f R a trade, and the 95 %% range (%+.3f to %+.3f) stays below "
+                         "zero. Do not trade this rule as it is." % (avg, lo, hi))
+    else:
+        st["verdict"] = ("No proven edge: %+.3f R a trade after costs, but the 95 %% range (%+.3f to %+.3f) "
+                         "includes zero. It could be luck either way." % (avg, lo, hi))
+    return st
+
+
+def usd(x):
+    return "%s$%.2f" % ("-" if x < 0 else "+", abs(x))
+
+
+def backtest_report(doc, max_loss=None):
+    ru, st = doc["rule"], doc["stats"]
+    stop_words = {"or_mid": "the opening-range midpoint", "or_low": "the opening-range low"}.get(
+        ru["stop_rule"], "%.2f %% under the entry" % ru.get("stop_pct", 0))
+    lines = ["Backtest: %d-min opening-range breakout, buy, stop at %s, %gR target, out by %s."
+             % (ru["or_minutes"], stop_words, ru["target_r"], clock12(int(doc["until"][:2]) * 60 + int(doc["until"][3:]))),
+             "Costs: %s; a stop that gaps fills at the open." % cost_words(doc["costs"]), ""]
+    if doc["symbols"]:
+        lines.append("  symbol  sessions  fired  target  stop  neither   avg R   after costs")
+        for p in doc["symbols"]:
+            lines.append("  %-6s  %8d  %5d  %6d  %4d  %7d  %6s  %12s" % (
+                p["symbol"], p["sessions"], p["triggered"], p["target"], p["stop"], p["close"],
+                "-" if p["avg_R"] is None else "%+.3f" % p["avg_R"],
+                "-" if p["avg_R_net"] is None else "%+.3f" % p["avg_R_net"]))
+        lines.append("")
+    for sym, why in sorted(doc["failed"].items()):
+        lines.append("Skipped %s: %s" % (sym, why))
+    if st["trades"]:
+        lines += [
+            "All together: %d trades, %.0f %% winners after costs." % (st["trades"], 100 * st["win_rate"]),
+            "  Average R %+.3f before costs, %+.3f after (95 %% range %+.3f to %+.3f)."
+            % (st["avg_R"], st["avg_R_net"], st["ci95_net"][0], st["ci95_net"][1]),
+            "  Total %+.2f R after costs, worst drawdown %.2f R%s."
+            % (st["total_R_net"], st["max_drawdown_R"],
+               "" if st["profit_factor_net"] is None else ", profit factor %.2f" % st["profit_factor_net"]),
+        ]
+        if st["gap_stops"]:
+            lines.append("  %d stop(s) gapped through and filled worse than -1 R." % st["gap_stops"])
+        if max_loss:
+            lines.append("  At $%g risked a trade: about %s a trade on average, %s in total, worst drawdown $%.2f."
+                         % (max_loss, usd(st["avg_R_net"] * max_loss), usd(st["total_R_net"] * max_loss),
+                            st["max_drawdown_R"] * max_loss))
+    lines += ["", st["verdict"],
+              "Yahoo keeps about 60 days of 5-minute bars, so this is a few months at most. "
+              "Past results do not promise future ones. Education and tooling, not financial advice."]
+    return lines
 
 
 # ---------------------------------------------------------------- output
@@ -784,8 +975,11 @@ def report(doc):
         % (until, m["median_close"], m["p5_close"], m["p95_close"]),
         "  Average R: %+.3f (R = the %.2f risk: %sR at the target, -1R at the stop)."
         % (m["avg_R"], p["risk_per_share"], ("+%g" % m["r_at_target"]), ),
-        "",
     ]
+    if "avg_R_net" in m:
+        lines.append("  After costs: %+.3f R (%s = %.3f R a trade; a stop that gaps fills at the open)."
+                     % (m["avg_R_net"], cost_words(m.get("costs") or {}), m.get("cost_R", 0)))
+    lines.append("")
     if h.get("rule"):
         ru = h["rule"]
         stop_words = {"or_mid": "opening-range midpoint", "or_low": "opening-range low",
@@ -796,11 +990,17 @@ def report(doc):
                          "those %d real sessions fired %d times: %d target, %d stop, %d neither. Average R %+.3f."
                          % (ru["or_minutes"], stop_words, ru["target_r"], h["sessions"], h["triggered"],
                             h["target"], h["stop"], h["close"], h["avg_R"]))
+            if h.get("avg_R_net") is not None:
+                lines.append("After costs the history averages %+.3f R a trade." % h["avg_R_net"])
         else:
             lines.append("History: the same rule never fired in those %d sessions." % h["sessions"])
     else:
         lines.append("History: " + h.get("note", "skipped."))
-    lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or []) + [""]
+    lines += ["", doc["verdict"]] + list(doc.get("verdict_notes") or [])
+    nets = [x for x in (m.get("avg_R_net"), h.get("avg_R_net")) if x is not None]
+    if nets and all(x < 0 for x in nets):
+        lines.append("After costs, both the replays and the history lose money on average: think twice.")
+    lines.append("")
     for w in doc.get("warnings") or []:
         lines.append("Note: " + w + ".")
     if doc["data"]["short_sessions_left_out"]:
@@ -874,7 +1074,7 @@ def compute(a):
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
         text, source = fetch_chart(plan["symbol"]), "yahoo"
-    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source)
+    return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, load_costs(a))
 
 
 def cmd_run(a):
@@ -909,6 +1109,70 @@ def cmd_chart(a):
     return 0
 
 
+def backtest_symbols(a):
+    if a.symbols:
+        syms = [x.strip().upper() for x in a.symbols.split(",") if x.strip()]
+    elif os.path.exists(a.watchlist):
+        try:
+            with open(a.watchlist, encoding="utf-8") as fh:
+                wl = json.load(fh)
+        except ValueError as e:
+            raise TMError("%s is not valid JSON: %s" % (a.watchlist, e))
+        rows = wl.get("hits", []) if isinstance(wl, dict) else wl
+        syms = [str(r.get("symbol") if isinstance(r, dict) else r).upper() for r in rows or []]
+    else:
+        raise TMError("give --symbols TSLA,AAPL,... (or run /trader-scanner for a trader/watchlist.json)")
+    syms = list(dict.fromkeys(s for s in syms if re.match(r"^[A-Z][A-Z0-9.\-]{0,9}$", s)))
+    if not syms:
+        raise TMError("no valid tickers to backtest")
+    if len(syms) > 200:
+        raise TMError("%d tickers is too many for one run (200 at most): be polite to the free data" % len(syms))
+    return syms
+
+
+def cmd_backtest(a):
+    now = parse_now(a.now)
+    if a.or_minutes < 5 or a.or_minutes % 5 or a.or_minutes >= 390:
+        raise TMError("--or-minutes must be a multiple of 5")
+    if not a.target_r > 0:
+        raise TMError("--target-r must be more than 0")
+    rule = {"setup": "orb", "or_minutes": a.or_minutes, "stop_rule": a.stop_rule, "target_r": a.target_r}
+    if a.stop_rule == "pct":
+        if not a.stop_pct or not 0 < a.stop_pct < 50:
+            raise TMError("--stop-rule pct needs --stop-pct, e.g. 1.5")
+        rule["stop_pct"] = a.stop_pct
+    costs = load_costs(a)
+    charts, failed = {}, {}
+    for n, sym in enumerate(backtest_symbols(a)):
+        try:
+            if a.offline:
+                charts[sym] = read_offline(a.offline, sym)
+            else:
+                if n:
+                    _sleep(PAUSE)
+                charts[sym] = fetch_chart(sym)
+        except TMError as e:
+            failed[sym] = str(e)
+    doc = backtest(charts, rule, now, a.until, costs)
+    doc["failed"].update(failed)
+    if a.write:
+        _write(a.write, doc)
+    if a.json:
+        print(json.dumps(doc, indent=2))
+        return 0
+    max_loss = a.max_loss
+    if max_loss is None and os.path.exists(a.config):
+        try:
+            with open(a.config, encoding="utf-8") as fh:
+                max_loss = (json.load(fh) or {}).get("max_loss_per_trade_usd")
+        except (ValueError, AttributeError):
+            max_loss = None
+    print("\n".join(backtest_report(doc, max_loss)))
+    if a.write:
+        print("Wrote %s." % a.write)
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Time Machine: replay a planned day trade (trader-timemachine).")
     sub = ap.add_subparsers(dest="cmd")
@@ -931,6 +1195,14 @@ def main(argv=None):
         p.add_argument("--until", help="end each replay at this time (default 16:00, the close)")
         p.add_argument("--offline", metavar="FILE", help="a saved Yahoo chart JSON (.json or .json.gz), no network")
         p.add_argument("--now", help='pretend it is this time ("2026-10-19 10:15" New York, or ISO with Z)')
+        cost_flags(p)
+
+    def cost_flags(p):
+        p.add_argument("--slippage-bps", type=float, help="slippage a side in bps of the entry (default %g, "
+                                                           "or slippage_bps in the config)" % SLIPPAGE_BPS)
+        p.add_argument("--commission", type=float, help="commission a share a side in $ (default %g, "
+                                                         "or commission_per_share in the config)" % COMMISSION)
+        p.add_argument("--config", default="trader/config.json")
 
     p = sub.add_parser("run", help="replay the plan: 10,000 simulated sessions plus the history")
     common(p)
@@ -941,12 +1213,28 @@ def main(argv=None):
     common(p)
     p.add_argument("--from", dest="from_file", nargs="?", const="trader/timemachine.json", metavar="PATH",
                    help="draw a saved result instead of running again")
+    p = sub.add_parser("backtest", help="the orb rule on every session of many stocks, after costs")
+    p.add_argument("--symbols", help="comma-separated tickers (default: trader/watchlist.json)")
+    p.add_argument("--watchlist", default="trader/watchlist.json")
+    p.add_argument("--or-minutes", type=int, default=15)
+    p.add_argument("--stop-rule", default="or_mid", choices=["or_mid", "or_low", "pct"])
+    p.add_argument("--stop-pct", type=float, help="with --stop-rule pct: the stop, in % under the entry")
+    p.add_argument("--target-r", type=float, default=1.0)
+    p.add_argument("--until", help="out by this time (default 16:00); your flat-by, e.g. 15:55")
+    p.add_argument("--max-loss", type=float, help="$ risked a trade, to show R in dollars "
+                                                   "(default max_loss_per_trade_usd in the config)")
+    p.add_argument("--offline", metavar="DIR", help="a folder of saved charts, <SYM>-60d5m.json(.gz)")
+    p.add_argument("--now", help='pretend it is this time ("2026-10-19 16:00" New York)')
+    cost_flags(p)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--write", nargs="?", const="trader/backtest.json", metavar="PATH",
+                   help="save the result (default trader/backtest.json)")
     a = ap.parse_args(argv)
     if not a.cmd:
         ap.print_help()
         return 1
     try:
-        return {"run": cmd_run, "chart": cmd_chart}[a.cmd](a)
+        return {"run": cmd_run, "chart": cmd_chart, "backtest": cmd_backtest}[a.cmd](a)
     except TMError as e:
         print("timemachine.py: %s" % e, file=sys.stderr)
         return 1

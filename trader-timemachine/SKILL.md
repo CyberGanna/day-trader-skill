@@ -12,7 +12,11 @@ description: >-
   "replay this trade", "what are the odds", "simulate this trade", "monte
   carlo", "backtest this setup", "how often does this hit the target", "is
   this a coin flip", or after /trader-exit writes a plan, before
-  /trader-budget.
+  /trader-budget. Also counts slippage and commissions (the average R after
+  costs) and backtests the opening-range rule on many stocks at once, with a
+  plain verdict on whether it has an edge after costs: use it when the user
+  says "backtest the strategy", "does this strategy work", "does it make
+  money after costs", "test it on many stocks".
 argument-hint: "[path to plan.json, or TICKER]"
 ---
 
@@ -37,11 +41,16 @@ python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --json
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" run --symbol TSLA --date 2026-10-19 \
     --entry 364.18 --stop 358.32 --target 370.04 --entry-time "10:15 AM"
 python3 "${CLAUDE_SKILL_DIR}/timemachine.py" chart --from           # ASCII fan chart of the saved run
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" backtest --symbols TSLA,AAPL,NVDA,AMD,META --until 15:55
+python3 "${CLAUDE_SKILL_DIR}/timemachine.py" backtest --target-r 2 --stop-rule or_low --write   # trader/watchlist.json
 ```
 
 Other flags: `--replays N`, `--seed N` (default 19), `--window N` (default 2
 bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
-`--now "2026-10-19 10:15"` (New York time) to pin the clock.
+`--now "2026-10-19 10:15"` (New York time) to pin the clock,
+`--slippage-bps N` (default 2, each side) and `--commission N` (dollars a
+share each side, default 0) for the costs; both also read `slippage_bps`
+and `commission_per_share` from `trader/config.json`.
 
 ## What it reads and writes
 
@@ -49,6 +58,8 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
 | --- | --- |
 | `trader/plan.json` | the plan from trader-exit: symbol, date, entry, entry_time / entry_bar, stop, stop_rule, target, target_r, opening range |
 | Yahoo chart API | one request: 60 days of 5-minute bars (`range=60d&interval=5m`), free and unofficial, can lag |
+| `trader/config.json` | optional: `slippage_bps`, `commission_per_share`, and `max_loss_per_trade_usd` for the backtest's dollars |
+| `trader/backtest.json` | with `backtest --write`: the rule, the costs, each symbol's numbers, the pooled stats and every trade |
 | `trader/timemachine.json` | with `--write`: `{plan, mc, history}` plus the verdict. `mc` holds the odds, percentiles, the fan-chart bands, 160 sample paths and a 24-bin histogram of the close |
 
 ## How it works
@@ -80,10 +91,42 @@ bars), `--offline FILE` (a saved Yahoo chart JSON, `.json` or `.json.gz`),
    more: "Strongly toward" one of them. So a 2R plan with target first
    24.1 % and stop first 50.5 % is close to break-even (it needs 33 % of
    the 74.6 % that hit a side, and got 32 %), not a loser.
-6. **Below the verdict**, when it applies: a line when more than 40 % of the
+6. **After costs.** The odds and the average R above are the plain ones.
+   Under them, "After costs" is the average R once two real things are
+   counted: slippage and commission on the way in and on the way out
+   (`cost_R` = 2 x entry x slippage bps / 10,000 + 2 x commission, over the
+   risk a share), and a stop that gaps through fills at that bar's open, not
+   at the stop. The history line gets its own after-costs average. When both
+   are below zero, the report says so in one line.
+7. **Below the verdict**, when it applies: a line when more than 40 % of the
    replays hit neither (the price at `--until` decides those), and the
    average R when its sign goes against the lean. Those can only point the
    other way because of the replays that hit neither.
+
+## The backtest
+
+`timemachine.py backtest` answers the question before the trade: does this
+rule make money at all, after costs? It runs the opening-range breakout (the
+opening range, the stop rule `or_mid`, `or_low` or `pct` with `--stop-pct`,
+and `--target-r`) on every full session in each stock's 60 days of 5-minute
+bars, for every ticker in `--symbols` or in `trader/watchlist.json`, then
+pools the trades:
+
+- per stock: sessions, how often it fired, target / stop / neither, the
+  average R before and after costs;
+- together: the win rate after costs, the average R after costs with its
+  95 % range (1.96 standard errors either side), the total R, the worst
+  drawdown in R, the profit factor and how many stops gapped through;
+- in dollars, at `--max-loss` (or the config's `max_loss_per_trade_usd`) a
+  trade;
+- one verdict: "An edge after costs" only when the whole 95 % range is above
+  zero, "Loses after costs" when it is all below, "No proven edge" when it
+  includes zero, and "Too few trades to tell" under 30 trades.
+
+One Yahoo request per ticker, half a second apart, 200 tickers at most. A
+ticker that fails is skipped and listed, it does not stop the run. Yahoo
+keeps about 60 days of 5-minute bars, so a backtest covers a few months at
+most: say so with the result.
 
 **The seed.** The draws come from Python's `random.Random(seed)`, seed 19 by
 default. Same plan, same data, same seed: the same numbers, on any machine.
@@ -103,14 +146,21 @@ grid). A live in-progress bar is never used.
 2. Run `timemachine.py run --write`. Add `--until 15:55` when the plan has a
    flat-by time, so "neither" means still open at the time you would get out.
 3. Tell the user, in this order: the four odds, the median and the 5 to 95
-   range of the price at the close, the average R, the history line, then the
-   verdict line and any line under it exactly as printed. Say the seed.
+   range of the price at the close, the average R and the average R after
+   costs, the history line with its after-costs average, then the verdict
+   line and any line under it exactly as printed. Say the seed.
 4. If the verdict is a coin flip or close to break-even, say so plainly. Do
    not dress it up. If the history and the replays disagree, say that too.
 5. Say once that this is built from the last 60 days and is not a prediction.
    Earnings, news and halts can do things those 60 days never did. Check
    `/trader-news` for the stock before going on.
 6. If the user still wants the trade, hand off to `/trader-budget` to size it.
+
+For a strategy rather than one trade, run `backtest` on the watchlist or on
+a handful of liquid stocks, with `--until` at the flat-by time. Repeat the
+verdict exactly as printed. If it says "No proven edge" or "Loses after
+costs", say plainly that the numbers do not support trading the rule as it
+is, and suggest paper trading or another rule instead.
 
 ## Example: the reel
 
@@ -148,11 +198,16 @@ the user should hear before `/trader-budget` sizes 8 shares.
   bar by bar, never tick by tick and never real time.
 - Always say the seed, so any run can be repeated.
 - One plan per run. A changed entry, stop, target or date is a new run.
+- Lead with the after-costs numbers when they change the picture: a rule
+  that is positive before costs and negative after is a losing rule.
+- A backtest that looks good on 60 days is a reason to paper trade it, not
+  proof. Never call a backtest a forecast.
 
 ## What it never does
 
 It never places an order, never sizes a position, never changes the plan,
-and never calls a result a sure thing. It never prints a P&L or a profit.
+and never calls a result a sure thing. It never forecasts a P&L or a profit: the backtest's dollars are the past
+record of a rule at your risk a trade, not a promise.
 It never uses a bar that has not closed yet, and never mixes today's bars
 into the pool.
 

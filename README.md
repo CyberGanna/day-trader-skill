@@ -134,6 +134,7 @@ python3 trader-entry/entry.py check TSLA --setup orb                   # waiting
 python3 trader-entry/entry.py watch TSLA --every 30                    # bar by bar until it triggers
 python3 trader-exit/exit.py plan --stop or-mid --target 1R --write     # -> trader/plan.json
 python3 trader-timemachine/timemachine.py run --write                  # 10,000 replays + the history
+python3 trader-timemachine/timemachine.py backtest --symbols TSLA,NVDA  # the rule on many stocks, after costs
 python3 trader-budget/size.py --write                                  # -> trader/orders.json
 python3 trader-risk/check.py                                           # PASS / BLOCK per order
 python3 trader-broker/ticket.py show                                   # the tickets, READY or not
@@ -169,6 +170,12 @@ selling or leverage unless you turn them on.
 **Paper first.** `"paper": true` is the default in `config.example.json`, and
 Alpaca's MCP server defaults to its paper account. Keys live in environment
 variables, never in the chat.
+
+**Costs count.** The Time Machine shows the average R after slippage (2
+bps a side by default) and commissions (`slippage_bps` and
+`commission_per_share` in `trader/config.json`), with a stop that gaps
+through filled at the bar's open. `timemachine.py backtest` runs the rule on
+many stocks and says whether it has an edge after costs, or not.
 
 **The Time Machine is a simulation, not a prediction.** It is built from the
 stock's own last 60 days of 5-minute bars. The future can do things those 60
