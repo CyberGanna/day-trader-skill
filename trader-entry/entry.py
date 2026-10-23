@@ -53,6 +53,7 @@ trigger, 1 otherwise. watchlist 0 when at least one symbol triggered.
 import argparse
 import datetime
 import gzip
+import importlib.util
 import json
 import os
 import re
@@ -106,6 +107,33 @@ EARLY = datetime.time(13, 0)
 
 class EntryError(Exception):
     pass
+
+
+def _load_alpaca():
+    """alpaca_data.py next to this script: Alpaca's bars in Yahoo's shape. None if it is missing."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpaca_data.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("alpaca_data", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ALPACA = _load_alpaca()
+
+
+def data_source():
+    """'alpaca' or 'yahoo' (see alpaca_data.py: TRADER_DATA, or Alpaca when its keys are set)."""
+    return ALPACA.source() if ALPACA else "yahoo"
+
+
+def alpaca_answer(path, error):
+    """Yahoo's JSON text for a chart or spark path, built from Alpaca's data."""
+    try:
+        return ALPACA.answer(path)
+    except ALPACA.AlpacaError as e:
+        raise error(str(e))
 
 
 # ---------------------------------------------------------------- time
@@ -264,6 +292,8 @@ def _sleep(seconds):
 def yahoo_get(path):
     """GET a Yahoo path: query2 first, query1 when query2 answers 429 or 5xx.
     An HTTP 429 gets one retry on the same host after BACKOFF seconds."""
+    if data_source() == "alpaca":
+        return alpaca_answer(path, EntryError)
     last = "no answer"
     for host in HOSTS:
         url = "https://%s.finance.yahoo.com%s" % (host, path)
@@ -566,7 +596,7 @@ def entry_doc(res, now_utc):
             "bar_index": t.get("bar_index"), "price": t.get("price"), "level": res.get("level"),
             "interval": res["interval"],
             "opening_range": {"high": orr["high"], "low": orr["low"], "minutes": orr["minutes"]} if orr else None,
-            "source": "yahoo", "checked_at": iso(now_utc), "reason": res.get("reason")}
+            "source": data_source(), "checked_at": iso(now_utc), "reason": res.get("reason")}
 
 
 def write_json(path, doc):

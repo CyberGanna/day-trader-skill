@@ -48,6 +48,7 @@ import argparse
 import csv
 import datetime
 import gzip
+import importlib.util
 import io
 import json
 import os
@@ -98,6 +99,33 @@ EARLY = datetime.time(13, 0)
 
 class AlertError(Exception):
     pass
+
+
+def _load_alpaca():
+    """alpaca_data.py next to this script: Alpaca's bars in Yahoo's shape. None if it is missing."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpaca_data.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("alpaca_data", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ALPACA = _load_alpaca()
+
+
+def data_source():
+    """'alpaca' or 'yahoo' (see alpaca_data.py: TRADER_DATA, or Alpaca when its keys are set)."""
+    return ALPACA.source() if ALPACA else "yahoo"
+
+
+def alpaca_answer(path, error):
+    """Yahoo's JSON text for a chart or spark path, built from Alpaca's data."""
+    try:
+        return ALPACA.answer(path)
+    except ALPACA.AlpacaError as e:
+        raise error(str(e))
 
 
 # ---------------------------------------------------------------- time
@@ -243,7 +271,7 @@ def parse_yahoo(text, sym):
     return {"symbol": sym.upper(), "price": float(price), "open": opens[0] if opens else None,
             "high": m.get("regularMarketDayHigh"), "low": m.get("regularMarketDayLow"),
             "prev_close": m.get("previousClose") or m.get("chartPreviousClose"), "time": when,
-            "currency": m.get("currency"), "source": "yahoo"}
+            "currency": m.get("currency"), "source": m.get("source") or "yahoo"}
 
 
 _urlopen = urllib.request.urlopen   # tests swap these two
@@ -280,7 +308,10 @@ def fetch(url, timeout=20):
 
 def fetch_yahoo(sym, timeout=20):
     """query2 first. A 429 waits BACKOFF seconds and tries once more; a 429 or a 5xx
-    after that moves on to query1. A 404 comes back as Yahoo's own error JSON."""
+    after that moves on to query1. A 404 comes back as Yahoo's own error JSON.
+    With Alpaca as the source (TRADER_DATA, or its keys set), one Alpaca request instead."""
+    if data_source() == "alpaca":
+        return alpaca_answer(yahoo_url(sym), AlertError)
     last = None
     for host in YAHOO_HOSTS:
         url = yahoo_url(sym, host)

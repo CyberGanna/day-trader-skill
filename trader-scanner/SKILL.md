@@ -186,6 +186,23 @@ oversold bounce).
 - Never print a P&L, a return or a profit figure.
 - A hit is stale once the price has moved on. Re-run before acting on it.
 
+## Alpaca data instead of Yahoo
+
+`alpaca_data.py`, next to this script, fetches the same bars from Alpaca's
+market data API and hands them over in Yahoo's shape, so nothing else changes.
+It is used when `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (or `APCA_API_KEY_ID`
+and `APCA_API_SECRET_KEY`) are set in your environment, and Yahoo when they are
+not. `TRADER_DATA=yahoo` or `TRADER_DATA=alpaca` forces one. Paper keys work:
+market data needs no trading permission. Set the keys yourself in your own
+terminal, never in the chat. `python3 alpaca_data.py TSLA` says which source
+is in use and fetches one chart to prove it.
+
+`ALPACA_FEED=auto` (the default) takes the full consolidated tape (SIP) for
+everything older than 16 minutes, which Alpaca's free plan allows, and IEX for
+the last 16 minutes of a live session: prices match the tape, but the volume
+of those last bars is IEX's share only. `ALPACA_FEED=sip` is for a paid plan,
+`ALPACA_FEED=iex` for IEX only.
+
 ## What it never does
 
 It never places, sizes or checks an order, never says which stock to buy,

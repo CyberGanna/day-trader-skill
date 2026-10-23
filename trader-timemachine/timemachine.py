@@ -66,6 +66,7 @@ Times are New York (ET) wall-clock; --now "2026-10-19 10:15" pins the clock.
 import argparse
 import datetime
 import gzip
+import importlib.util
 import json
 import math
 import os
@@ -109,6 +110,33 @@ MIN_TRADES = 30      # the backtest gives no verdict below this many trades
 
 class TMError(Exception):
     pass
+
+
+def _load_alpaca():
+    """alpaca_data.py next to this script: Alpaca's bars in Yahoo's shape. None if it is missing."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpaca_data.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("alpaca_data", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ALPACA = _load_alpaca()
+
+
+def data_source():
+    """'alpaca' or 'yahoo' (see alpaca_data.py: TRADER_DATA, or Alpaca when its keys are set)."""
+    return ALPACA.source() if ALPACA else "yahoo"
+
+
+def alpaca_answer(path, error):
+    """Yahoo's JSON text for a chart or spark path, built from Alpaca's data."""
+    try:
+        return ALPACA.answer(path)
+    except ALPACA.AlpacaError as e:
+        raise error(str(e))
 
 
 # ---------------------------------------------------------------- time (copied from trader-alerts)
@@ -205,7 +233,9 @@ def _get(url, timeout=20):
 
 def fetch_chart(sym):
     """One request for 60 days of 5-min bars. query2 first, one retry after a 429,
-    then query1 on 429 or 5xx."""
+    then query1 on 429 or 5xx. With Alpaca as the source, one Alpaca request instead."""
+    if data_source() == "alpaca":
+        return alpaca_answer(chart_url(sym), TMError)
     last = None
     for n, host in enumerate(HOSTS):
         if n:
@@ -1073,7 +1103,7 @@ def compute(a):
     if a.offline:
         text, source = read_offline(a.offline, plan["symbol"]), "offline"
     else:
-        text, source = fetch_chart(plan["symbol"]), "yahoo"
+        text, source = fetch_chart(plan["symbol"]), data_source()
     return time_machine(text, plan, now, a.replays, a.seed, a.window, a.until, source, load_costs(a))
 
 

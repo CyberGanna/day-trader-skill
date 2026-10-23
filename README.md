@@ -192,6 +192,12 @@ official API: it can lag, change or rate-limit you. The scanner and the entry
 timer read 1-minute or 5-minute bars, not every tick. Check anything that
 matters against your broker before you act on it.
 
+**Alpaca data, when you have keys.** With `ALPACA_API_KEY` and
+`ALPACA_SECRET_KEY` set in your environment (paper keys work), the Time
+Machine, the scanner, the entry timer, the exit planner and the alerts read
+Alpaca's official market data instead of Yahoo, through `alpaca_data.py` in
+each skill. Without keys, Yahoo as before. `TRADER_DATA=yahoo` forces Yahoo.
+
 **Day-trading rules.** FINRA removed the $25,000 pattern-day-trader minimum
 on June 4, 2026 (Regulatory Notice 26-10), and brokers may phase the change
 in until October 20, 2027, so yours may still apply the old rule. If it does,
