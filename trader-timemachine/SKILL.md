@@ -1,22 +1,17 @@
 ---
 name: trader-timemachine
 description: >-
-  Time Machine. Replays every possible outcome of a trade before you risk a
-  dollar: 10,000 simulated sessions plus every past time the setup fired.
-  Takes the plan from trader-exit (entry, stop, target), rebuilds the rest of
-  the day 10,000 times from the stock's own 5-minute bars over the last 60
-  days, and re-runs the same rule on every past session. Prints the odds of
-  target first, stop first, or neither by the close, where the price sits at
-  the close, the average R, the history, and one honest verdict, then hands
-  off to /trader-budget. Use when the user says "run the time machine",
-  "replay this trade", "what are the odds", "simulate this trade", "monte
-  carlo", "backtest this setup", "how often does this hit the target", "is
-  this a coin flip", or after /trader-exit writes a plan, before
-  /trader-budget. Also counts slippage and commissions (the average R after
-  costs) and backtests the opening-range rule on many stocks at once, with a
-  plain verdict on whether it has an edge after costs: use it when the user
-  says "backtest the strategy", "does this strategy work", "does it make
-  money after costs", "test it on many stocks".
+  Time Machine. Replays a planned day trade before you risk a dollar: 10,000
+  simulated sessions from the stock's own last 60 days of 5-minute bars,
+  plus the same rule on every past session. Prints the odds of target first,
+  stop first or neither by the close, the average R before and after costs
+  (slippage, commission, stops that gap), the history and one honest
+  verdict. Its backtest runs the opening-range rule on many stocks at once
+  and says whether it has an edge after costs. Use when the user says "run
+  the time machine", "replay this trade", "what are the odds", "monte
+  carlo", "backtest this setup", "backtest the strategy", "does it make
+  money after costs", "is this a coin flip", or after /trader-exit writes a
+  plan, before /trader-budget.
 argument-hint: "[path to plan.json, or TICKER]"
 ---
 

@@ -233,5 +233,20 @@ class Cli(unittest.TestCase):
         self.assertEqual(sleeps, [tm.PAUSE])
 
 
+class SkillFile(unittest.TestCase):
+    def test_description_fits_the_upload_limit(self):
+        # claude.ai refuses a skill whose description is over 1024 characters
+        import re
+        from _load import ROOT
+        for d in sorted(os.listdir(ROOT)):
+            path = os.path.join(ROOT, d, "SKILL.md")
+            if not os.path.isfile(path):
+                continue
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+            desc = re.search(r"description: >-\n(.*?)\n[a-z-]+:", text, re.S).group(1)
+            self.assertLessEqual(len(" ".join(desc.split())), 1024, d)
+
+
 if __name__ == "__main__":
     unittest.main()
