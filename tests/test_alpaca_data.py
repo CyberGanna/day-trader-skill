@@ -86,11 +86,17 @@ class Settings(Base):
         os.environ.update(APCA_API_KEY_ID="k", APCA_API_SECRET_KEY="s")
         self.assertEqual(AD.source(), "alpaca")
 
+    def test_the_skills_own_key_names_come_first(self):
+        os.environ.update(TRADER_ALPACA_KEY="mine", TRADER_ALPACA_SECRET="my-secret")
+        self.assertEqual(AD.keys(), ("mine", "my-secret"))
+        os.environ.pop("TRADER_ALPACA_SECRET")
+        self.assertEqual(AD.keys(), ("PKTEST", "secret"))   # half a pair is ignored
+
     def test_no_keys_is_a_plain_error(self):
         os.environ.pop("ALPACA_API_KEY")
         with self.assertRaises(AD.AlpacaError) as e:
             AD.chart("TSLA", "1d", "5m")
-        self.assertIn("ALPACA_API_KEY", str(e.exception))
+        self.assertIn("TRADER_ALPACA_KEY", str(e.exception))
 
     def test_keys_go_in_headers_only(self):
         fake = self.serve(FakeAlpaca())
@@ -182,6 +188,7 @@ class Command(Base):
         with mock.patch("sys.stdout", out):
             self.assertEqual(AD.main(["spy"]), 0)
         self.assertIn("Source: alpaca", out.getvalue())
+        self.assertIn("keys in ALPACA_API_KEY", out.getvalue())
         self.assertIn("SPY: 12 five-minute bars", out.getvalue())
         self.assertIn("previous close 99.5", out.getvalue())
         os.environ.pop("ALPACA_API_KEY")

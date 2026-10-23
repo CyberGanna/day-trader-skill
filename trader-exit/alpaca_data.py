@@ -13,7 +13,9 @@ Which source a skill uses (source()):
   TRADER_DATA=alpaca or TRADER_DATA=yahoo, when set; otherwise Alpaca when its keys are in
   the environment, Yahoo when they are not.
 
-Keys come only from environment variables, never from a file, a flag or the chat:
+Keys come only from environment variables, never from a file, a flag or the chat, first pair found:
+  TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET (names only these skills read: use them when another
+  program on the same PC already reads the standard names, so the two never share keys by accident),
   ALPACA_API_KEY and ALPACA_SECRET_KEY (the names Alpaca's own MCP server uses), or
   APCA_API_KEY_ID and APCA_API_SECRET_KEY (the names Alpaca's SDKs use).
 Market data needs no trading permission; paper keys work.
@@ -37,7 +39,8 @@ import urllib.parse
 import urllib.request
 
 BASE = "https://data.alpaca.markets"
-KEY_PAIRS = (("ALPACA_API_KEY", "ALPACA_SECRET_KEY"), ("APCA_API_KEY_ID", "APCA_API_SECRET_KEY"))
+KEY_PAIRS = (("TRADER_ALPACA_KEY", "TRADER_ALPACA_SECRET"), ("ALPACA_API_KEY", "ALPACA_SECRET_KEY"),
+             ("APCA_API_KEY_ID", "APCA_API_SECRET_KEY"))
 DELAY = datetime.timedelta(minutes=16)   # the free plan's SIP data is 15 minutes behind
 TIMEFRAMES = {"1m": ("1Min", 60), "2m": ("2Min", 120), "5m": ("5Min", 300), "15m": ("15Min", 900),
               "30m": ("30Min", 1800), "60m": ("1Hour", 3600), "1h": ("1Hour", 3600), "1d": ("1Day", 86400)}
@@ -129,7 +132,7 @@ def _parse_t(text):
 def _get(path, params):
     k = keys()
     if not k:
-        raise AlpacaError("no Alpaca keys in the environment: set ALPACA_API_KEY and ALPACA_SECRET_KEY "
+        raise AlpacaError("no Alpaca keys in the environment: set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET "
                           "(see the skill's SKILL.md), or TRADER_DATA=yahoo")
     url = BASE + path + "?" + urllib.parse.urlencode(params)
     req = urllib.request.Request(url, headers={"APCA-API-KEY-ID": k[0], "APCA-API-SECRET-KEY": k[1],
@@ -321,11 +324,12 @@ def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     sym = (argv[0] if argv else "SPY").upper()
     k = keys()
+    pair = next((p for p in KEY_PAIRS if os.environ.get(p[0]) and os.environ.get(p[1])), None)
     print("Source: %s (TRADER_DATA=%s, Alpaca keys %s), feed %s" % (
-        source(), os.environ.get("TRADER_DATA") or "not set", "found" if k else "not found",
+        source(), os.environ.get("TRADER_DATA") or "not set", "in " + pair[0] if pair else "not found",
         os.environ.get("ALPACA_FEED") or "auto"))
     if not k:
-        print("Set ALPACA_API_KEY and ALPACA_SECRET_KEY in your environment to use Alpaca.")
+        print("Set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET in your environment to use Alpaca.")
         return 1
     try:
         doc = chart(to_yahoo(sym), "1d", "5m")
