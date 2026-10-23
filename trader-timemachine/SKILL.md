@@ -202,9 +202,10 @@ the user should hear before `/trader-budget` sizes 8 shares.
 
 `alpaca_data.py`, next to this script, fetches the same bars from Alpaca's
 market data API and hands them over in Yahoo's shape, so nothing else changes.
-It is used when `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` (or `APCA_API_KEY_ID`
-and `APCA_API_SECRET_KEY`) are set in your environment, and Yahoo when they are
-not. `TRADER_DATA=yahoo` or `TRADER_DATA=alpaca` forces one. Paper keys work:
+It is used when `TRADER_ALPACA_KEY` and `TRADER_ALPACA_SECRET` are set in your
+environment (names only these skills read, so another program's Alpaca keys are
+never picked up by accident), or else `ALPACA_API_KEY` and `ALPACA_SECRET_KEY`,
+or `APCA_API_KEY_ID` and `APCA_API_SECRET_KEY`; Yahoo when none are. `TRADER_DATA=yahoo` or `TRADER_DATA=alpaca` forces one. Paper keys work:
 market data needs no trading permission. Set the keys yourself in your own
 terminal, never in the chat. `python3 alpaca_data.py TSLA` says which source
 is in use and fetches one chart to prove it.
