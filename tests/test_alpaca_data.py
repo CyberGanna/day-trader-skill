@@ -151,6 +151,14 @@ class Shape(Base):
         self.assertEqual(m["regularMarketTime"], int(datetime.datetime(2026, 10, 23, 14, 59, 58,
                                                                        tzinfo=datetime.timezone.utc).timestamp()))
 
+    def test_extended_hours_bars_are_left_out_like_yahoo(self):
+        rows = five_min(NOW.date(), 8, 0, 66)   # pre-market, 4:00 to 9:25 New York
+        rows += five_min(NOW.date(), 13, 30, 6)
+        self.serve(FakeAlpaca(sip={"TSLA": rows}, iex={"TSLA": rows}))
+        r = AD.chart("TSLA", "1d", "5m")["chart"]["result"][0]
+        first = datetime.datetime.fromtimestamp(r["timestamp"][0], datetime.timezone.utc)
+        self.assertEqual((len(r["timestamp"]), first.strftime("%H:%M")), (6, "13:30"))
+
     def test_daily_bars_are_stamped_at_the_open_like_yahoo(self):
         rows = [bar("2026-10-%02dT04:00:00Z" % d, 100.0 + d) for d in (19, 20, 21, 22)]
         self.serve(FakeAlpaca(sip={"BRK.B": rows}))

@@ -236,6 +236,8 @@ def _result(ysym, interval, rows, keep, snap=None):
         t = _parse_t(b["t"])
         day = eastern_date(t)
         ts = eastern_to_epoch(day, 9, 30) if daily else int(t.timestamp())
+        if not daily and not eastern_to_epoch(day, 9, 30) <= ts < eastern_to_epoch(day, 16, 0):
+            continue   # Alpaca includes pre- and post-market bars; Yahoo's default chart does not
         stamped.append((day, ts, b))
     prev_close = None
     if keep:
