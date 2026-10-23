@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import types
 import unittest
+from unittest import mock
 from contextlib import redirect_stdout, redirect_stderr
 
 from _load import load, ROOT, FIX
@@ -42,6 +43,7 @@ class FakeMT5:
         self.positions = positions or []
         self.send_retcode, self.check_retcode = send_retcode, check_retcode
         self.checked, self.sent, self.shutdowns = [], [], 0
+        self.quotes = []  # ticks served before the steady quote, e.g. bid 0 / ask 0 right after symbol_select
 
     def initialize(self):
         return True
@@ -69,6 +71,8 @@ class FakeMT5:
         return name in self.symbols
 
     def symbol_info_tick(self, name):
+        if self.quotes:
+            return self.quotes.pop(0)
         return ns(bid=364.10, ask=364.18)
 
     def positions_get(self, symbol=None):
@@ -237,6 +241,17 @@ class Bridge(unittest.TestCase):
         self.assertEqual(self.send()[0], 1)
 
 
+    def test_no_quote_no_order(self):
+        self.fake.quotes = [ns(bid=0.0, ask=0.0)] * 50
+        self.run_risk()
+        self.approve()
+        with mock.patch.object(mt5.time, "sleep"):
+            code, _, err = self.send("--dry-run")
+        self.assertEqual(code, 1)
+        self.assertIn("no price", err)
+        self.assertEqual(self.fake.checked, [])
+
+
 class Requests(unittest.TestCase):
     def setUp(self):
         self.m = FakeMT5()
@@ -253,6 +268,16 @@ class Requests(unittest.TestCase):
         self.assertEqual(mt5.resolve_symbol(m, "TSLA", {"mt5_symbols": {"TSLA": "TSLA.OQ"}}), "TSLA.OQ")
         with self.assertRaises(mt5.MT5Error):
             mt5.resolve_symbol(FakeMT5(symbols={"TSLAX.US": self.info}), "TSLA", {})
+
+    def test_a_quote_that_arrives_late_is_waited_for(self):
+        self.m.quotes = [ns(bid=0.0, ask=0.0), ns(bid=0.0, ask=0.0)]
+        with mock.patch.object(mt5.time, "sleep") as sleep:
+            tick = mt5.live_tick(self.m, "TSLA.US")
+        self.assertEqual((tick.bid, tick.ask), (364.10, 364.18))
+        self.assertEqual(sleep.call_count, 2)
+        self.m.quotes = [ns(bid=0.0, ask=0.0)] * 20
+        with mock.patch.object(mt5.time, "sleep"):
+            self.assertIsNone(mt5.live_tick(self.m, "TSLA.US"))
 
     def test_lots_must_be_exact(self):
         cfd = ns(trade_contract_size=10, volume_min=0.1, volume_max=100, volume_step=0.1)
