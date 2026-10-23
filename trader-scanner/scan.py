@@ -71,6 +71,7 @@ Exit code 0 when the scan found something, 1 when it did not or could not run.
 import argparse
 import datetime
 import gzip
+import importlib.util
 import json
 import os
 import re
@@ -84,6 +85,7 @@ YAHOO_HOSTS = ("https://query2.finance.yahoo.com", "https://query1.finance.yahoo
 NASDAQ_FILES = ("nasdaqlisted.txt", "otherlisted.txt")
 NASDAQ_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/"
 SPARK_MAX = 20      # Yahoo's spark answers 400 above 20 symbols
+ALPACA_BATCH = 100  # symbols per Alpaca bars request (3 months of daily bars fit one page)
 PAUSE = 0.3         # seconds between requests: be polite to free endpoints
 BACKOFF = 5.0       # seconds to wait before the one retry after a 429
 SLEEP = time.sleep  # tests swap this out
@@ -137,6 +139,33 @@ LABEL = dict(SETUPS)
 
 class ScanError(Exception):
     pass
+
+
+def _load_alpaca():
+    """alpaca_data.py next to this script: Alpaca's bars in Yahoo's shape. None if it is missing."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alpaca_data.py")
+    if not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location("alpaca_data", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+ALPACA = _load_alpaca()
+
+
+def data_source():
+    """'alpaca' or 'yahoo' (see alpaca_data.py: TRADER_DATA, or Alpaca when its keys are set)."""
+    return ALPACA.source() if ALPACA else "yahoo"
+
+
+def alpaca_answer(path, error):
+    """Yahoo's JSON text for a chart or spark path, built from Alpaca's data."""
+    try:
+        return ALPACA.answer(path)
+    except ALPACA.AlpacaError as e:
+        raise error(str(e))
 
 
 # ---------------------------------------------------------------- time
@@ -234,7 +263,10 @@ def http_get(url, timeout=20):
 
 def yahoo_get(path):
     """GET a Yahoo Finance path. query2 first, query1 on a 429 or 5xx, and one
-    more round after BACKOFF seconds if a 429 was seen. 4xx other than 429 is final."""
+    more round after BACKOFF seconds if a 429 was seen. 4xx other than 429 is final.
+    With Alpaca as the source, the same JSON built from Alpaca's data."""
+    if data_source() == "alpaca":
+        return alpaca_answer(path, ScanError)
     last = "no answer"
     for attempt in (0, 1):
         saw_429 = False
@@ -747,7 +779,8 @@ def progress(a, msg):
 def fetch_spark(symbols, rng, interval, pause, a=None):
     """Batches of 20. -> ({SYM: series}, {SYM: error})."""
     data, failed = {}, {}
-    batches = [symbols[i:i + SPARK_MAX] for i in range(0, len(symbols), SPARK_MAX)]
+    size = ALPACA_BATCH if data_source() == "alpaca" else SPARK_MAX
+    batches = [symbols[i:i + size] for i in range(0, len(symbols), size)]
     for k, batch in enumerate(batches):
         if k and pause:
             SLEEP(pause)
@@ -897,7 +930,7 @@ def cmd_daily(a):
     as_of = ("%s close" % last_date.isoformat()) if last_date else None
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "daily",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
-           "source": "yahoo", "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
+           "source": data_source(), "filters": {"min_price": a.min_price, "min_volume": a.min_volume},
            "note": NOTE, "hits": hits}
     if a.offline:
         doc["offline"] = os.path.basename(a.offline.rstrip("/"))
@@ -985,7 +1018,7 @@ def cmd_orb(a):
     as_of = "%s %s ET" % (day.isoformat(), cutoff.strftime("%H:%M"))
     doc = {"created_by": "trader-scanner", "created_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"), "mode": "orb",
            "as_of": as_of, "universe": len(symbols), "scanned": counts["scanned"], "failed": nfailed,
-           "unconfirmed": counts["unconfirmed"], "source": "yahoo", "or_minutes": a.or_minutes,
+           "unconfirmed": counts["unconfirmed"], "source": data_source(), "or_minutes": a.or_minutes,
            "interval": "%dm" % BAR_MIN,
            "filters": {"min_price": a.min_price, "min_volume": a.min_volume}, "note": NOTE, "hits": hits}
     if a.offline:
