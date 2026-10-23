@@ -138,6 +138,7 @@ python3 trader-timemachine/timemachine.py backtest --symbols TSLA,NVDA  # the ru
 python3 trader-budget/size.py --write                                  # -> trader/orders.json
 python3 trader-risk/check.py                                           # PASS / BLOCK per order
 python3 trader-broker/ticket.py show                                   # the tickets, READY or not
+python trader-broker/mt5.py send --index 1 --dry-run                 # MetaTrader 5 demo (Windows)
 python3 trader-alerts/alerts.py add --from-plan                        # stop, target, flat by close
 python3 trader-alerts/alerts.py check                                  # rings what hit, once
 python3 trader-analyst/facts.py TSLA                                   # quarters, growth, EPS
