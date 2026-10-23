@@ -10,7 +10,8 @@ description: >-
   and logs each trade's max loss so trader-risk can hold the daily limit.
   Covers setting up Alpaca's official MCP server in Claude Desktop (paper by
   default, keys in env vars, never in chat), the Interactive Brokers
-  connector, and setting order tools to "Needs approval". Use when the user
+  connector, a MetaTrader 5 demo account (mt5.py), and setting order tools
+  to "Needs approval". Use when the user
   says "place the order", "buy it", "execute", "send it to my broker",
   "close my position", "flatten", "get me out", "connect Alpaca", "set up
   paper trading", or after /trader-risk passes.
@@ -39,6 +40,14 @@ python3 "${CLAUDE_SKILL_DIR}/ticket.py" result --index 1 --status placed --broke
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" fill --symbol TSLA --side sell --qty 8 --price 370.04
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" flatten --symbol TSLA --qty 8
 python3 "${CLAUDE_SKILL_DIR}/ticket.py" log
+```
+
+```bash
+python "${CLAUDE_SKILL_DIR}/mt5.py" check                         # MetaTrader 5: the terminal and the account
+python "${CLAUDE_SKILL_DIR}/mt5.py" symbol TSLA                   # the broker's name for TSLA, lots, stops
+python "${CLAUDE_SKILL_DIR}/mt5.py" send --index 1 --dry-run      # the broker's order_check, nothing sent
+python "${CLAUDE_SKILL_DIR}/mt5.py" send --index 1                # only after the yes is recorded
+python "${CLAUDE_SKILL_DIR}/mt5.py" positions
 ```
 
 `ticket.py` never talks to a broker. It renders tickets, checks that a reply
@@ -135,6 +144,42 @@ submits orders directly to the market. So with IBKR the final yes happens in
 IBKR as well. Set `"broker": "ibkr"` in `trader/config.json`. Set its tools
 that draft orders to Needs approval too.
 
+## Setup C: MetaTrader 5 (demo account, Windows)
+
+`mt5.py` sends an approved ticket to a MetaTrader 5 terminal through
+MetaQuotes' official `MetaTrader5` Python package. That package runs only on
+Windows, next to an open terminal, so this works in Claude Code on the
+user's Windows PC, not in the cloud. MetaTrader 4 has no Python API and is
+not supported.
+
+1. The user opens a **demo** account with their MT5 broker and logs in to it
+   in the MetaTrader 5 terminal, then turns on **Algo Trading** in the
+   toolbar. The password stays in the terminal: `mt5.py` attaches to the
+   session that is already logged in and never asks for, reads or stores it.
+2. `pip install MetaTrader5`, then `python mt5.py check`. It must say DEMO.
+3. In `trader/config.json`: `"broker": "mt5"`. If the broker's name for a
+   stock is not the ticker itself or an obvious variant (`TSLA.US`, `#TSLA`),
+   map it: `"mt5_symbols": {"TSLA": "TSLA.US"}`. `mt5.py symbol TSLA` shows
+   what the broker calls it, how many shares a lot is, and the minimum stop
+   distance.
+4. In `.claude/settings.json` keep the send on ask, never in allow:
+   `"permissions": {"ask": ["Bash(python*mt5.py send*)"]}`. That permission
+   prompt is the Allow once / Deny card for MetaTrader.
+
+What it checks before anything goes out: trader-risk passed this exact
+order today, the user's yes for it is recorded today and nothing was sent on
+it since (one yes, one send), the account is DEMO, the share quantity is an
+exact number of the broker's lots, the stop and target are far enough from
+the price for the broker, and the broker's own `order_check` accepts it. The
+bracket's stop-loss and take-profit ride on the position as MT5 SL and TP, so
+there is nothing to cancel when flattening: on a hedging account the sell
+names the position and closes it, and it never opens a short. A real account
+is refused unless `trader/config.json` has both `"paper": false` and
+`"mt5_allow_real": true`, which only the user sets.
+
+Many MT5 brokers offer stocks as CFDs, with their own trading hours,
+spreads and overnight fees. Check `mt5.py symbol` before the first trade.
+
 ## Steps: the entry
 
 1. `ticket.py show`. Only READY tickets go to the user. A ticket that is NOT
@@ -147,6 +192,8 @@ that draft orders to Needs approval too.
    stock or amount). Ask again. Never turn a reply into a yes yourself.
 4. Only after "Recorded your yes", call `place_stock_order` with exactly the
    JSON the ticket printed. Claude's card appears: Allow once or Deny.
+   With `"broker": "mt5"`, run `mt5.py send --index N --dry-run` first, then
+   `mt5.py send --index N`; it records the result itself (skip step 5).
 5. Record what happened: `ticket.py result --index N --status placed
    --broker-id <id> --filled-qty Q --filled-price P` (the fill from the
    response or `get_open_position`), or `--status denied`, or `--status failed`
@@ -197,6 +244,8 @@ buttons: Allow once, Deny. Allow once sends it to the paper account. The
 - Never places orders from a scheduled or background task: nobody is there to say yes.
 - Never asks for, reads, stores or repeats API keys or passwords.
 - Never switches `ALPACA_PAPER_TRADE` or `"paper"` to live. The user does that themselves.
+- Never sets `mt5_allow_real`, never sends to a real MetaTrader account on its own, and never puts
+  `mt5.py send` in an allow list.
 - Never calls `close_all_positions`, `cancel_all_orders`, option or crypto order tools on its own.
 - Never promises a fill price: a market order and a stop fill at whatever the market gives.
 

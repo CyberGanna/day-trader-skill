@@ -354,7 +354,8 @@ def render(order, idx, total, cfg, risk, state, today):
     broker = str(cfg.get("broker", "alpaca")).lower()
     paper = cfg.get("paper", True)
     acct = "PAPER account" if paper else "LIVE ACCOUNT, REAL MONEY"
-    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, "Interactive Brokers" if broker == "ibkr" else "Alpaca")]
+    name = {"ibkr": "Interactive Brokers", "mt5": "MetaTrader 5"}.get(broker, "Alpaca")
+    lines = ["ORDER %d of %d, %s, %s" % (idx, total, acct, name)]
     for part in plain_parts(order):
         lines.append("  " + part)
     if order.get("why"):
@@ -365,6 +366,9 @@ def render(order, idx, total, cfg, risk, state, today):
     if broker == "ibkr":
         lines.append("  Claude drafts this with the Interactive Brokers connector. IBKR sends it to your")
         lines.append("  IBKR account, and it only goes to the market after you approve it there.")
+    elif broker == "mt5":
+        lines.append("  After your yes, Claude runs mt5.py send --index %d: the MetaTrader 5 terminal on" % idx)
+        lines.append("  your PC sends it to your demo account, the stop-loss and take-profit as SL and TP.")
     else:
         lines.append("  Claude will call place_stock_order with exactly:")
         for l in json.dumps(tool_input(order), indent=2).splitlines():
@@ -518,6 +522,9 @@ def cmd_approve(a):
     print("Recorded your yes for order %d: %s." % (a.index, plain(order)))
     if str(cfg.get("broker", "alpaca")).lower() == "ibkr":
         print("Now draft it with the Interactive Brokers connector; approve it in your IBKR account.")
+    elif str(cfg.get("broker", "alpaca")).lower() == "mt5":
+        print("Now run: mt5.py send --index %d   (Claude Code asks you to allow the command; "
+              "add --dry-run to only check it)" % a.index)
     else:
         print("Now call place_stock_order with exactly:")
         print(json.dumps(tool_input(order), indent=2))
