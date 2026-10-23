@@ -168,6 +168,19 @@ class Shape(Base):
         ts = res[0]["response"][0]["timestamp"][0]
         self.assertEqual(datetime.datetime.fromtimestamp(ts, datetime.timezone.utc).strftime("%H:%M"), "13:30")
 
+    def test_rate_limits_wait_and_retry(self):
+        ok = FakeAlpaca(sip={"TSLA": five_min(NOW.date(), 13, 30, 6)})
+        busy = FakeAlpaca(status=(429, "{}"))
+        answers = [busy, busy, ok, ok, ok, ok]
+        self.serve(lambda req, timeout=None: answers.pop(0)(req, timeout))
+        with mock.patch.object(AD, "_sleep") as sleep:
+            r = AD.chart("TSLA", "1d", "5m")["chart"]["result"][0]
+        self.assertEqual(len(r["timestamp"]), 6)
+        self.assertEqual(sleep.call_count, 2)
+        self.serve(FakeAlpaca(status=(429, "{}")))
+        with mock.patch.object(AD, "_sleep"), self.assertRaisesRegex(AD.AlpacaError, "rate limiting"):
+            AD.chart("TSLA", "1d", "5m")
+
     def test_pages_are_followed(self):
         sip = five_min(datetime.date(2026, 10, 22), 13, 30, 78)
         fake = self.serve(FakeAlpaca(sip={"TSLA": sip}, page=20))

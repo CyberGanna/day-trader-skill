@@ -222,7 +222,7 @@ class Cli(unittest.TestCase):
     def test_the_network_path_is_polite(self):
         calls, sleeps = [], []
         saved = (tm.fetch_chart, tm._sleep)
-        tm.fetch_chart = lambda sym: calls.append(sym) or renamed(sym)
+        tm.fetch_chart = lambda sym, rng="60d": calls.append(sym) or renamed(sym)
         tm._sleep = sleeps.append
         try:
             code, out, _ = run(["backtest", "--symbols", "AAAA,BBBB", "--now", AFTER, "--config", self.cfg])
