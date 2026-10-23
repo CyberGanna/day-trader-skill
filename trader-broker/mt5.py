@@ -33,6 +33,7 @@ import importlib.util
 import json
 import os
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MAGIC = 190190          # marks this pack's orders in the terminal
@@ -191,6 +192,18 @@ def stops_ok(info, req):
 
 # ---------------------------------------------------------------- commands
 
+def live_tick(m, name, tries=10, wait=0.3):
+    """The terminal's quote, waiting briefly after symbol_select: the first tick of a symbol
+    just added to Market Watch reads bid 0 / ask 0 until a price arrives. None if none comes."""
+    for i in range(tries):
+        tick = m.symbol_info_tick(name)
+        if tick is not None and tick.bid > 0 and tick.ask > 0:
+            return tick
+        if i < tries - 1:
+            time.sleep(wait)
+    return None
+
+
 def _cfg(a):
     return ticket.read_json(a.config, "config", required=False) or {}
 
@@ -220,7 +233,7 @@ def cmd_symbol(a):
     try:
         name = resolve_symbol(m, a.ticker, cfg)
         m.symbol_select(name, True)
-        info, tick = m.symbol_info(name), m.symbol_info_tick(name)
+        info, tick = m.symbol_info(name), live_tick(m, name)
         print("%s -> %s (%s)" % (a.ticker.upper(), name, getattr(info, "description", "")))
         print("  1 lot = %g shares, lots from %g to %g in steps of %g" % (
             getattr(info, "trade_contract_size", 1), info.volume_min, info.volume_max, info.volume_step))
@@ -228,6 +241,8 @@ def cmd_symbol(a):
             info.digits, getattr(info, "spread", 0), getattr(info, "trade_stops_level", 0)))
         if tick:
             print("  bid %s, ask %s" % (tick.bid, tick.ask))
+        else:
+            print("  no price right now: its market is closed, or the broker sends no quotes for it")
     finally:
         m.shutdown()
     return 0
@@ -268,7 +283,7 @@ def cmd_send(a):
         name = resolve_symbol(m, order.get("symbol", ""), cfg)
         if not m.symbol_select(name, True):
             raise MT5Error("the terminal could not show %s in Market Watch" % name)
-        info, tick = m.symbol_info(name), m.symbol_info_tick(name)
+        info, tick = m.symbol_info(name), live_tick(m, name)
         if info is None or tick is None:
             raise MT5Error("no price for %s right now: is its market open?" % name)
         req = build_request(m, order, name, info, tick, account)
