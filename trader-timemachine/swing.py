@@ -100,13 +100,25 @@ def read_daily(folder, sym):
         return json.load(fh)["bars"]
 
 
+GAP_DAYS = 30                    # calendar days without a bar: the ticker went to another company
+
+
+def first_run(B):
+    """The bars up to the first hole longer than GAP_DAYS: a delisted ticker that a new
+    company took over later must not join two companies into one chart."""
+    for k in range(1, len(B)):
+        if (datetime.date.fromisoformat(B[k]["d"]) - datetime.date.fromisoformat(B[k - 1]["d"])).days > GAP_DAYS:
+            return B[:k]
+    return B
+
+
 def load_daily(a):
     """{SYMBOL: daily bars}, from --daily or from the 5-minute files in --offline."""
     out, failed = {}, {}
     for sym in tm.backtest_symbols(a):
         try:
             if a.daily:
-                out[sym] = read_daily(a.daily, sym)
+                out[sym] = first_run(read_daily(a.daily, sym))
             else:
                 text = tm.read_offline(a.offline, sym)
                 out[sym] = daily_from_sessions(cf.sessions_of(text, sym, tm.parse_now(a.now)))
