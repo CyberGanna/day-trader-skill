@@ -2,6 +2,7 @@
 """Momentum lab (trader-timemachine): hold last year's winners, rebalanced once a month.
 
   python momentum.py backtest --watchlist universo-2016.json --daily giornaliero [--top 10]
+  python momentum.py plan --watchlist universo-2016.json --ibkr <folder> --date YYYY-MM-DD [--held A,B] [--budget 10000]
 
 At each month's last close it ranks the stocks by their return over the 12 months
 before, leaving out the last month (the "12-1" momentum of the research), and holds
@@ -184,6 +185,92 @@ def cmd_backtest(a):
     return 0
 
 
+# ---------------------------------------------------------------- the monthly plan (no orders)
+
+PLAN_BARS = 260                   # daily bars to ask the IBKR connector for: 12 months and a few days
+
+
+def nyse_day(d):
+    """True on an NYSE trading day (trader-alerts' holiday list)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, os.path.join(os.path.dirname(here), "trader-alerts"))
+    import alerts
+    return alerts.trading_day(d)[0]
+
+
+def last_trading_day_of_month(d):
+    if not nyse_day(d):
+        return False
+    nxt = d + datetime.timedelta(days=1)
+    while not nyse_day(nxt):
+        nxt += datetime.timedelta(days=1)
+    return nxt.month != d.month
+
+
+def plan(daily, day, top=TOP, held=(), budget=None):
+    """The --top stocks by 12-1 momentum on the close of `day`, and the changes from `held`."""
+    rows = []
+    for sym, B in daily.items():
+        B = [b for b in B if b["d"] <= day]
+        if not B or B[-1]["d"] != day:
+            continue
+        px = [b["c"] for b in B]
+        sc = score(px, len(px) - 1)
+        if sc is not None:
+            rows.append({"symbol": sym, "momentum": round(sc, 4), "close": px[-1]})
+    rows.sort(key=lambda r: -r["momentum"])
+    keep = rows[:top]
+    want = [r["symbol"] for r in keep]
+    held = [h.upper() for h in held]
+    doc = {"date": day, "top": top, "ranked": len(rows), "hold": keep,
+           "sell": [h for h in held if h not in want], "buy": [s for s in want if s not in held],
+           "keep": [s for s in want if s in held]}
+    if budget:
+        each = budget / float(top)
+        for r in keep:
+            r["shares_for_budget"] = int(each // r["close"])
+        doc["budget"] = budget
+    return doc
+
+
+def plan_report(doc):
+    out = ["Momentum plan on the close of %s: the %d best of %d stocks by 12-1 month return."
+           % (doc["date"], doc["top"], doc["ranked"])]
+    for r in doc["hold"]:
+        extra = "  %d shares for %.0f $" % (r["shares_for_budget"], doc["budget"] / doc["top"]) if "budget" in doc else ""
+        out.append("  %-6s %+7.1f%%   close %.2f%s" % (r["symbol"], 100 * r["momentum"], r["close"], extra))
+    out.append("Sell: %s. Buy: %s. Keep: %s." % (", ".join(doc["sell"]) or "none", ", ".join(doc["buy"]) or "none",
+                                                ", ".join(doc["keep"]) or "none"))
+    out.append("A plan only: nothing was ordered. Orders go to Alpaca paper only after the user says yes, one by one.")
+    return out
+
+
+def cmd_plan(a):
+    day = a.date
+    if a.only_month_end and not last_trading_day_of_month(datetime.date.fromisoformat(day)):
+        print("%s is not the month's last trading day: no plan." % day)
+        return 0
+    daily, missing = {}, []
+    for sym in tm.backtest_symbols(a):
+        try:
+            daily[sym] = (sw.ibkr_daily(os.path.join(a.ibkr, "%s-daily.json" % sym)) if a.ibkr
+                          else sw.first_run(sw.read_daily(a.daily, sym)))
+        except tm.TMError:
+            missing.append(sym)
+    doc = plan(daily, day, a.top, [x for x in (a.held or "").split(",") if x.strip()], a.budget)
+    doc["missing"] = missing
+    if len(doc["hold"]) < a.top:
+        raise tm.TMError("only %d stocks have %d days of bars up to %s (missing: %s)"
+                         % (len(doc["hold"]), LOOKBACK + 1, day, ", ".join(missing) or "none"))
+    if a.out:
+        with open(a.out, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=1)
+    print(json.dumps(doc, indent=2) if a.json else "\n".join(plan_report(doc)))
+    if missing:
+        print("No data for: %s." % ", ".join(missing))
+    return 0
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Momentum lab: last year's winners, rebalanced monthly (trader-timemachine).")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -197,9 +284,22 @@ def main(argv=None):
     p.add_argument("--runs", type=int, default=RANDOM_RUNS, help="random portfolios (%d)" % RANDOM_RUNS)
     p.add_argument("--seed", type=int, default=SEED, help="seed of the random portfolios (%d)" % SEED)
     p.add_argument("--json", action="store_true", help="print the numbers as JSON")
+    p = sub.add_parser("plan", help="this month's holdings and the changes, from daily bars (no orders)")
+    p.add_argument("--symbols", help="tickers, comma separated")
+    p.add_argument("--watchlist", default="trader/watchlist.json", help="used when --symbols is not given")
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--ibkr", help="folder with <SYM>-daily.json from the IBKR connector (ONE_DAY, step_count %d)" % PLAN_BARS)
+    src.add_argument("--daily", help="the folder swing.py download wrote")
+    p.add_argument("--date", required=True, help="the close the plan is made on, YYYY-MM-DD")
+    p.add_argument("--only-month-end", action="store_true", help="do nothing unless --date is the month's last trading day")
+    p.add_argument("--top", type=int, default=TOP, help="stocks held (%d)" % TOP)
+    p.add_argument("--held", help="what the portfolio holds now, comma separated")
+    p.add_argument("--budget", type=float, help="dollars for the whole portfolio: shares per stock")
+    p.add_argument("--out", help="write the plan here as JSON")
+    p.add_argument("--json", action="store_true", help="print the plan as JSON")
     a = ap.parse_args(argv)
     try:
-        return {"backtest": cmd_backtest}[a.cmd](a)
+        return {"backtest": cmd_backtest, "plan": cmd_plan}[a.cmd](a)
     except tm.TMError as e:
         print("momentum: %s" % e, file=sys.stderr)
         return 1

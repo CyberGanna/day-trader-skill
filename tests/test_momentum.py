@@ -67,5 +67,43 @@ class Lab(unittest.TestCase):
             shutil.rmtree(d)
 
 
+class Plan(unittest.TestCase):
+    def test_month_end_calendar(self):
+        self.assertTrue(mo.last_trading_day_of_month(datetime.date(2026, 10, 30)))     # Friday, the 31st is a Saturday
+        self.assertFalse(mo.last_trading_day_of_month(datetime.date(2026, 10, 29)))
+        self.assertTrue(mo.last_trading_day_of_month(datetime.date(2026, 12, 31)))
+        self.assertFalse(mo.last_trading_day_of_month(datetime.date(2026, 10, 31)))
+
+    def test_plan_ranks_and_lists_the_changes(self):
+        daily = {"UP": series(300, 0.002), "FLAT": series(300, 0.0), "DOWN": series(300, -0.001)}
+        day = daily["UP"][-1]["d"]
+        doc = mo.plan(daily, day, top=2, held=["DOWN", "FLAT"], budget=1000)
+        self.assertEqual([r["symbol"] for r in doc["hold"]], ["UP", "FLAT"])
+        self.assertEqual((doc["sell"], doc["buy"], doc["keep"]), (["DOWN"], ["UP"], ["FLAT"]))
+        self.assertEqual(doc["hold"][1]["shares_for_budget"], 5)
+
+    def test_plan_cli_needs_enough_stocks(self):
+        d = tempfile.mkdtemp()
+        try:
+            for sym, g in (("AAA", 0.001), ("BBB", -0.0005)):
+                B = series(300, g)
+                with open(os.path.join(d, "%s-daily.json" % sym), "w", encoding="utf-8") as fh:
+                    json.dump({"time": [b["d"] + "T13:30:00Z" for b in B], "open": [b["o"] for b in B],
+                               "high": [b["h"] for b in B], "low": [b["l"] for b in B],
+                               "close": [b["c"] for b in B], "volume": [1] * len(B)}, fh)
+            day = B[-1]["d"]
+            code, out, err = run(["plan", "--symbols", "AAA,BBB,CCC", "--ibkr", d, "--date", day, "--top", "1"])
+            self.assertEqual(code, 0, err)
+            self.assertIn("Buy: AAA.", out)
+            self.assertIn("No data for: CCC.", out)
+            self.assertIn("nothing was ordered", out)
+            code, _, err = run(["plan", "--symbols", "AAA,BBB", "--ibkr", d, "--date", day, "--top", "5"])
+            self.assertEqual(code, 1)
+            code, out, _ = run(["plan", "--symbols", "AAA", "--ibkr", d, "--date", "2026-10-29", "--only-month-end"])
+            self.assertIn("not the month's last trading day", out)
+        finally:
+            shutil.rmtree(d)
+
+
 if __name__ == "__main__":
     unittest.main()
