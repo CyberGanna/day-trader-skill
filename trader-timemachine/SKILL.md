@@ -190,6 +190,26 @@ absorption in the footprint, with the lab's exits, beside random entries, first
 half of the days against the second. Weeks of flow are a small sample: a signal
 that beats random there is a hint, not an edge.
 
+**Gamma levels (`gamma.py`).** Phase 5. `gamma.py TSLA` reads the open
+interest of options expiring within 30 days (Alpaca's trading API, GET only)
+and their gamma (Alpaca's free indicative options feed), and prints the call
+wall, the put wall, the zero-gamma level and the total exposure. The sign
+assumes dealers are long calls and short puts; say that it is an assumption.
+There is no free history of open interest, so gamma is a live filter only and
+the shadow journal judges it. The order book (level 2) needs paid data and is
+not in this skill.
+
+**Shadow signals (`confluence.py live-context`, `live`, `live-review`).**
+Phase 6, for the daily routines. Before the open, `live-context --ibkr <dir>`
+reads each stock's daily (70 bars) and hourly (a month) bars saved from the
+IBKR connector and writes the D/H4/H1 bias. During the session, `live --ibkr
+<dir> --context <file> --journal <file>` reads today's 5-minute bars and, when
+at least `--level` (4) signals agree in the same direction, appends ONE
+proposal per stock per day to the journal with entry, stop and target. In the
+evening, `live-review` replays each proposal on the day's bars and prints the
+journal's results after costs. Nothing is ever ordered: these are shadow
+trades, and the engine has not passed its test, so say so with every proposal.
+
 **The seed.** The draws come from Python's `random.Random(seed)`, seed 19 by
 default. Same plan, same data, same seed: the same numbers, on any machine.
 Say the seed with every result so the user can repeat it.
