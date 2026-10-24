@@ -217,6 +217,14 @@ live --ibkr <dir> --date <today> --journal <file>` adds one shadow buy proposal 
 stock when the engine's votes reach `--level` (2) on today's daily bar, and
 `swing.py review` closes them at the stop, the target or after 10 days.
 
+**The momentum lab (`momentum.py`).** `momentum.py backtest --watchlist
+universo-2016.json --daily giornaliero --top 10` holds the 10 stocks with the best
+return over the 12 months before, leaving out the last month, rebalanced at each
+month's last close, against SPY bought and held, every stock in equal weights,
+the same with a SPY 200-day trend filter, and 200 portfolios picked at random.
+Prices are split-adjusted without dividends. Use a list picked without hindsight;
+say that taxes on monthly turnover are not in the numbers.
+
 **Shadow signals (`confluence.py live-context`, `live`, `live-review`).**
 Phase 6, for the daily routines. Before the open, `live-context --ibkr <dir>`
 reads each stock's daily (70 bars) and hourly (a month) bars saved from the
