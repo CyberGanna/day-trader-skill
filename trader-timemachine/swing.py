@@ -2,9 +2,13 @@
 """Swing lab (trader-timemachine): the confluence signals on daily bars, held for days.
 
   python swing.py download --symbols AAPL,TSLA,... --years 10 --out giornaliero
+  python swing.py universe --year 2016 --top 100 --out universo-2016.json   (picked without hindsight)
+  python swing.py download --watchlist universo-2016.json --years 10 --out giornaliero
   python swing.py backtest --symbols AAPL,TSLA,... --daily giornaliero
   python swing.py backtest --symbols AAPL,TSLA,... --offline storico      (daily bars built from 5-minute ones)
-  python swing.py engine   --symbols AAPL,TSLA,... --daily giornaliero
+  python swing.py engine   --symbols AAPL,TSLA,... --daily giornaliero [--side buy]
+  python swing.py live     --ibkr <day folder> --symbols ... --date YYYY-MM-DD --journal diario-swing.json
+  python swing.py review   --ibkr <day folder> --journal diario-swing.json
 
 Intraday, every signal was worth about 0 R before costs and lost after them. On
 daily bars the stop is wider, so the same costs are a much smaller part of R.
@@ -69,6 +73,11 @@ RANDOM_SHARE = 0.10
 VOTE_LEVELS = (2, 3, 4)
 MIN_TRAIN = 100
 SEED = 7
+SIDES = {"both": (1, -1), "buy": (1,), "sell": (-1,)}
+
+
+def side_word(sides):
+    return "buys and sells" if len(sides) == 2 else "buys only" if sides == (1,) else "sells only"
 
 
 # ---------------------------------------------------------------- data
@@ -130,6 +139,62 @@ def cmd_download(a):
         with gzip.open(daily_path(a.out, sym), "wt", encoding="utf-8") as fh:
             json.dump({"symbol": sym, "bars": rows}, fh)
         print("%-6s %d days, %s to %s" % (sym, len(rows), rows[0]["d"], rows[-1]["d"]))
+    return 0
+
+
+FUND_WORDS = (" etf", "etf ", " fund", " trust", "ishares", "spdr", "proshares", "direxion", "invesco", "vanguard",
+              " etn", "notes due", "warrant", " units", "preferred", "depositary shares")
+
+
+def universe(year, top, min_price=5.0, min_days=200):
+    """The most traded US stocks of a past year, picked with that year's data only: every
+    asset Alpaca lists (active and inactive, so stocks delisted since are in), its daily
+    bars of that year, ranked by average dollar volume."""
+    import gamma
+    assets = []
+    for status in ("active", "inactive"):
+        got = gamma._get_trading("/v2/assets", {"asset_class": "us_equity", "status": status})
+        if not isinstance(got, list):
+            raise tm.TMError("Alpaca's asset list came back in an unexpected shape")
+        assets += got
+    names = {}
+    for x in assets:
+        sym, name = str(x.get("symbol") or ""), " %s " % str(x.get("name") or "").lower()
+        if (x.get("exchange") in ("NYSE", "NASDAQ", "AMEX") and sym.isalpha() and len(sym) <= 5
+                and not any(w in name for w in FUND_WORDS)):
+            names[sym] = x.get("status")
+    syms = sorted(names)
+    start = datetime.datetime(year, 1, 1, tzinfo=datetime.timezone.utc)
+    end = datetime.datetime(year + 1, 1, 1, tzinfo=datetime.timezone.utc)
+    ranked = []
+    for i in range(0, len(syms), 200):
+        try:
+            got = ad._bars(syms[i:i + 200], "1Day", start, end, "sip")
+        except ad.AlpacaError as e:
+            raise tm.TMError(str(e))
+        for sym, rows in got.items():
+            if sym not in names or len(rows) < min_days or statistics.mean(r["c"] for r in rows) < min_price:
+                continue
+            ranked.append((statistics.mean(r["c"] * r["v"] for r in rows), sym))
+    ranked.sort(reverse=True)
+    pick = [sym for _, sym in ranked[:top]]
+    return {"year": year, "picked_by": "average dollar volume in %d, price %g or more, %d days or more"
+            % (year, min_price, min_days), "hits": pick,
+            "inactive_now": [sym for sym in pick if names.get(sym) != "active"], "candidates": len(syms)}
+
+
+def cmd_universe(a):
+    if not ad.keys():
+        raise tm.TMError("no Alpaca keys in the environment: set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET")
+    if not 2016 <= a.year <= 2025 or not 10 <= a.top <= 500:
+        raise tm.TMError("--year goes from 2016 to 2025, --top from 10 to 500")
+    doc = universe(a.year, a.top)
+    with open(a.out, "w", encoding="utf-8") as fh:
+        json.dump(doc, fh, indent=1)
+    print("%d stocks picked from %d with %d data only (%s). %d of them are no longer listed: %s."
+          % (len(doc["hits"]), doc["candidates"], a.year, doc["picked_by"], len(doc["inactive_now"]),
+             ", ".join(doc["inactive_now"]) or "none"))
+    print("Written to %s. Next: swing.py download --watchlist %s --years 10 --out giornaliero" % (a.out, a.out))
     return 0
 
 
@@ -311,7 +376,7 @@ def fire_all(B, X, signals, rng):
     return out
 
 
-def run_symbol(sym, B, costs, signals=SIGNALS, seed=SEED, **exits):
+def run_symbol(sym, B, costs, signals=SIGNALS, seed=SEED, sides=(1, -1), **exits):
     X = indicators(B)
     fired = fire_all(B, X, signals, random.Random("%s-%s" % (seed, sym)))
     out = {}
@@ -319,7 +384,7 @@ def run_symbol(sym, B, costs, signals=SIGNALS, seed=SEED, **exits):
         trades, free = [], 0
         for i in sorted(fired[name]):
             side = fired[name][i]
-            if i < free or (with_ctx and X["trend"][i] != side):
+            if i < free or side not in sides or (with_ctx and X["trend"][i] != side):
                 continue
             r = trade(B, i, side, X["atr"][i], costs, **exits)
             if r:
@@ -330,14 +395,14 @@ def run_symbol(sym, B, costs, signals=SIGNALS, seed=SEED, **exits):
     return out, X, fired
 
 
-def lab(daily, costs, signals=SIGNALS, seed=SEED, **exits):
+def lab(daily, costs, signals=SIGNALS, seed=SEED, sides=(1, -1), **exits):
     every = {v: [] for v in variants(signals)}
     per, failed, dates = {}, {}, []
     for sym, B in daily.items():
         if len(B) <= WARMUP + LOOKBACK:
             failed[sym] = "%d days: the lab needs more than %d" % (len(B), WARMUP + LOOKBACK)
             continue
-        out, _, _ = run_symbol(sym, B, costs, signals, seed, **exits)
+        out, _, _ = run_symbol(sym, B, costs, signals, seed, sides, **exits)
         for v in out:
             every[v] += out[v]
         per[sym] = {"days": len(B), "first": B[0]["d"], "last": B[-1]["d"]}
@@ -359,19 +424,19 @@ def lab(daily, costs, signals=SIGNALS, seed=SEED, **exits):
                              and min(st["year1_trades"], st["year2_trades"]) >= tm.MIN_TRADES
                              and st["year1"] > b["year1"] and st["year2"] > b["year2"])
     return {"split": cut, "exits": dict({"target_r": TARGET_R, "stop_atr": STOP_ATR, "hold": HOLD}, **exits),
-            "costs": dict(costs), "symbols": per, "failed": failed, "rows": rows}
+            "costs": dict(costs), "sides": side_word(sides), "symbols": per, "failed": failed, "rows": rows}
 
 
 def lab_report(doc):
     x = doc["exits"]
-    out = ["Swing lab: %d stocks, %s, in at the next open, stop %g ATR(14), target %gR, out after %d days."
-           % (len(doc["symbols"]), tm.cost_words(doc["costs"]), x["stop_atr"], x["target_r"], x["hold"]),
+    out = ["Swing lab: %d stocks, %s, %s, in at the next open, stop %g ATR(14), target %gR, out after %d days."
+           % (len(doc["symbols"]), doc["sides"], tm.cost_words(doc["costs"]), x["stop_atr"], x["target_r"], x["hold"]),
            "First half = before %s, second half = from it." % doc["split"], ""]
     head = "  %-28s %6s %8s %8s  %-17s %7s %7s %7s %7s  %-8s %s" % (
         "signal", "trades", "gross R", "net R", "95 % range", "half 1", "half 2", "buys", "sells", "verdict",
         "beats random")
     for with_ctx in (False, True):
-        out.append("Alone (buys and sells):" if not with_ctx else "With the daily trend (its direction only):")
+        out.append("Alone:" if not with_ctx else "With the daily trend (its direction only):")
         out.append(head)
         for r in doc["rows"]:
             if r["context"] != with_ctx:
@@ -411,7 +476,7 @@ def votes(fired, X, i):
     return up + (t == 1), dn + (t == -1)
 
 
-def engine_trades(sym, B, costs, level, signals=SIGNALS, **exits):
+def engine_trades(sym, B, costs, level, signals=SIGNALS, sides=(1, -1), **exits):
     X = indicators(B)
     fired = fire_all(B, X, signals, random.Random(0))
     trades, free = [], 0
@@ -420,7 +485,7 @@ def engine_trades(sym, B, costs, level, signals=SIGNALS, **exits):
             continue
         up, dn = votes(fired, X, i)
         side = 1 if up >= level and up > dn else -1 if dn >= level and dn > up else 0
-        if not side:
+        if side not in sides:
             continue
         r = trade(B, i, side, X["atr"][i], costs, **exits)
         if r:
@@ -430,18 +495,18 @@ def engine_trades(sym, B, costs, level, signals=SIGNALS, **exits):
     return trades
 
 
-def engine(daily, costs, signals=SIGNALS, **exits):
+def engine(daily, costs, signals=SIGNALS, sides=(1, -1), **exits):
     usable = {s: B for s, B in daily.items() if len(B) > WARMUP + LOOKBACK}
     if not usable:
         raise tm.TMError("no stock had enough history")
     cut = cf.split_date([d for B in usable.values() for d in (B[WARMUP]["d"], B[-1]["d"])])
     rows = []
     for lv in VOTE_LEVELS:
-        tr = [t for s, B in usable.items() for t in engine_trades(s, B, costs, lv, signals, **exits)]
+        tr = [t for s, B in usable.items() for t in engine_trades(s, B, costs, lv, signals, sides, **exits)]
         rows.append({"level": lv, "train": [t for t in tr if t["date"] < cut], "test": [t for t in tr if t["date"] >= cut]})
     ok = [r for r in rows if len(r["train"]) >= MIN_TRAIN]
     best = max(ok, key=lambda r: cf.avg_net(r["train"])) if ok else None
-    doc = {"split": cut, "costs": dict(costs), "symbols": sorted(usable), "levels": [
+    doc = {"split": cut, "costs": dict(costs), "sides": side_word(sides), "symbols": sorted(usable), "levels": [
         {"level": r["level"], "train_trades": len(r["train"]), "train_avg": cf.avg_net(r["train"]),
          "test_trades": len(r["test"]), "test_avg": cf.avg_net(r["test"])} for r in rows], "picked": None}
     if best:
@@ -451,8 +516,8 @@ def engine(daily, costs, signals=SIGNALS, **exits):
 
 
 def engine_report(doc):
-    out = ["Swing engine: %d stocks, %s. Votes last %d days; the daily trend votes too."
-           % (len(doc["symbols"]), tm.cost_words(doc["costs"]), STATE_DAYS),
+    out = ["Swing engine: %d stocks, %s, %s. Votes last %d days; the daily trend votes too."
+           % (len(doc["symbols"]), doc["sides"], tm.cost_words(doc["costs"]), STATE_DAYS),
            "Level picked on the first half (before %s), judged once on the second." % doc["split"], "",
            "  level  half-1 trades  half-1 avg R  half-2 trades  half-2 avg R"]
     f = lambda v: "-" if v is None else "%+.3f" % v  # noqa: E731
@@ -473,6 +538,115 @@ def engine_report(doc):
     return out
 
 
+# ---------------------------------------------------------------- live, from the IBKR connector (shadow only)
+
+LIVE_LEVEL = 2                  # the engine's level on 10 years of daily bars
+LIVE_BARS = 130                 # daily bars to ask the connector for: the cloud needs 78, the 20-day signals 20 more
+
+
+def ibkr_daily(path):
+    """Daily bars from a saved get_price_history (step ONE_DAY) answer."""
+    return [{"d": r["date"], "o": r["o"], "h": r["h"], "l": r["l"], "c": r["c"], "v": r["v"]} for r in cf.ibkr_rows(path)]
+
+
+def live_votes(B, signals=SIGNALS):
+    """The engine's votes on the last day of B: (buy votes, sell votes, the signals that agree with buying)."""
+    X = indicators(B)
+    i = len(B) - 1
+    fired = {n: {} for n in signals}
+    for j in range(i - STATE_DAYS + 1, i + 1):
+        for n in signals:
+            sd = GENERATORS[n](B, X, j)
+            if sd:
+                fired[n][j] = sd
+    up, dn = votes(fired, X, i)
+    why = [n for n in signals if next((fired[n][j] for j in range(i, i - STATE_DAYS, -1) if j in fired[n]), 0) == 1]
+    return up, dn, why + (["trend"] if X["trend"][i] == 1 else []), X["atr"][i]
+
+
+def cmd_live(a):
+    syms = tm.backtest_symbols(a)
+    journal = cf.read_journal(a.journal)
+    busy = {j["symbol"] for j in journal if j.get("status") == "open"}
+    new, lines = [], []
+    for sym in syms:
+        try:
+            B = [b for b in ibkr_daily(os.path.join(a.ibkr, "%s-daily.json" % sym)) if b["d"] <= a.date]
+        except tm.TMError as e:
+            lines.append("%-6s %s" % (sym, e))
+            continue
+        if not B or B[-1]["d"] != a.date:
+            lines.append("%-6s no daily bar for %s yet" % (sym, a.date))
+            continue
+        if len(B) < WARMUP + LOOKBACK + 18:
+            lines.append("%-6s %d daily bars: ask the connector for %d" % (sym, len(B), LIVE_BARS))
+            continue
+        up, dn, why, atr_now = live_votes(B)
+        if up >= a.level and up > dn and sym not in busy:
+            risk = round(STOP_ATR * atr_now, 2)
+            new.append({"symbol": sym, "signal_date": a.date, "side": "buy", "close": B[-1]["c"], "atr": round(atr_now, 4),
+                        "risk": risk, "stop_hint": round(B[-1]["c"] - risk, 2),
+                        "target_hint": round(B[-1]["c"] + TARGET_R * risk, 2), "votes": why, "status": "open"})
+            lines.append("%-6s PROPOSAL buy at tomorrow's open, stop %.2f under it, target %gR, out after %d days (%s)"
+                         % (sym, risk, TARGET_R, HOLD, ", ".join(why)))
+        else:
+            lines.append("%-6s %d buy votes, %d sell votes%s" % (sym, up, dn, " (already in a shadow trade)" if sym in busy else ""))
+    if new:
+        cf.write_json(a.journal, journal + new)
+    print("Swing shadow signals for %s (level %d, buys only):" % (a.date, a.level))
+    print("\n".join("  " + x for x in lines))
+    print("%d new shadow proposals. Shadow only: nothing was ordered." % len(new))
+    return 0
+
+
+def review_entry(j, B, costs):
+    """Replays one shadow proposal on the bars after its signal day: closed with a result, or still open."""
+    i = next((k for k, b in enumerate(B) if b["d"] == j["signal_date"]), None)
+    if i is None or i + 1 >= len(B):
+        return j
+    t, end = trade(B, i, 1, j["atr"], costs)
+    done = t["outcome"] != "close" or end == i + HOLD
+    out = dict(j, entry=t["entry"], stop=t["stop"], target=t["target"])
+    if done:
+        out.update(status="closed", outcome=t["outcome"], days=t["days"], R=t["R"], R_net=t["R_net"],
+                   exit_date=B[end]["d"])
+    else:
+        out.update(so_far_R=round((B[-1]["c"] - t["entry"]) / (t["entry"] - t["stop"]), 3), days=len(B) - 1 - i)
+    return out
+
+
+def cmd_review(a):
+    journal = cf.read_journal(a.journal)
+    costs = tm.load_costs(a)
+    cache, changed = {}, 0
+    for n, j in enumerate(journal):
+        if j.get("status") != "open":
+            continue
+        sym = j["symbol"]
+        if sym not in cache:
+            try:
+                cache[sym] = ibkr_daily(os.path.join(a.ibkr, "%s-daily.json" % sym))
+            except tm.TMError as e:
+                print("%-6s %s" % (sym, e))
+                cache[sym] = []
+        new = review_entry(j, cache[sym], costs)
+        if new != j:
+            journal[n], changed = new, changed + 1
+            if new["status"] == "closed":
+                print("%-6s from %s: %s after %d days, %+.2f R after costs" % (sym, j["signal_date"], new["outcome"],
+                                                                              new["days"], new["R_net"]))
+    if changed:
+        cf.write_json(a.journal, journal)
+    closed = [dict(j, date=j["signal_date"], time="09:30") for j in journal if j.get("status") == "closed"]
+    still = sum(1 for j in journal if j.get("status") == "open")
+    st = tm.backtest_stats(sorted(closed, key=lambda t: t["date"]))
+    print("Swing shadow journal: %d closed, %d still open." % (len(closed), still))
+    if closed:
+        print("  average %+.3f R after costs, %.0f %% winners. %s" % (st["avg_R_net"], 100 * st["win_rate"], st["verdict"]))
+    print("Shadow only: nothing was ordered.")
+    return 0
+
+
 # ---------------------------------------------------------------- command line
 
 def exits_of(a):
@@ -484,7 +658,7 @@ def exits_of(a):
 def cmd_backtest(a):
     exits = exits_of(a)
     daily, failed = load_daily(a)
-    doc = lab(daily, tm.load_costs(a), SIGNALS, a.seed, **exits)
+    doc = lab(daily, tm.load_costs(a), SIGNALS, a.seed, SIDES[a.side], **exits)
     doc["failed"].update(failed)
     print(json.dumps(doc, indent=2) if a.json else "\n".join(lab_report(doc)))
     return 0
@@ -493,7 +667,7 @@ def cmd_backtest(a):
 def cmd_engine(a):
     exits = exits_of(a)
     daily, failed = load_daily(a)
-    doc = engine(daily, tm.load_costs(a), SIGNALS, **exits)
+    doc = engine(daily, tm.load_costs(a), SIGNALS, SIDES[a.side], **exits)
     doc["failed"] = failed
     if a.json:
         print(json.dumps(doc, indent=2))
@@ -528,10 +702,30 @@ def main(argv=None):
         p.add_argument("--commission", type=float, help="commission a share a side in $ (default %g)" % tm.COMMISSION)
         p.add_argument("--config", default="trader/config.json", help="costs from here when the flags are not given")
         p.add_argument("--seed", type=int, default=SEED, help="seed of the random entries (%d)" % SEED)
+        p.add_argument("--side", choices=sorted(SIDES), default="both", help="buys, sells or both (both)")
         p.add_argument("--json", action="store_true", help="print the numbers as JSON")
+    p = sub.add_parser("universe", help="the most traded stocks of a past year, delisted ones included")
+    p.add_argument("--year", type=int, default=2016, help="the year the stocks are picked in (2016)")
+    p.add_argument("--top", type=int, default=100, help="how many (100)")
+    p.add_argument("--out", default="universo-2016.json", help="the list to write (universo-2016.json)")
+    p = sub.add_parser("live", help="today's swing votes from the IBKR connector's daily bars, shadow proposals")
+    p.add_argument("--ibkr", required=True, help="folder with <SYM>-daily.json (ONE_DAY, step_count %d)" % LIVE_BARS)
+    p.add_argument("--symbols", help="tickers, comma separated")
+    p.add_argument("--watchlist", default="trader/watchlist.json", help="used when --symbols is not given")
+    p.add_argument("--date", required=True, help="today, YYYY-MM-DD: its daily bar must be complete")
+    p.add_argument("--level", type=int, default=LIVE_LEVEL, help="agreeing buy votes for a proposal (%d)" % LIVE_LEVEL)
+    p.add_argument("--journal", required=True, help="the swing shadow journal")
+    p = sub.add_parser("review", help="replay the open swing shadow proposals on the newest daily bars")
+    p.add_argument("--ibkr", required=True, help="folder with <SYM>-daily.json")
+    p.add_argument("--journal", required=True, help="the swing shadow journal")
+    p.add_argument("--slippage-bps", type=float, help="slippage a side in bps (default %g)" % tm.SLIPPAGE_BPS)
+    p.add_argument("--commission", type=float, help="commission a share a side in $ (default %g)" % tm.COMMISSION)
+    p.add_argument("--config", default="trader/config.json", help="costs from here when the flags are not given")
     a = ap.parse_args(argv)
     try:
-        return {"download": cmd_download, "backtest": cmd_backtest, "engine": cmd_engine}[a.cmd](a)
+        return {"download": cmd_download, "backtest": cmd_backtest, "engine": cmd_engine, "live": cmd_live,
+                "universe": cmd_universe,
+                "review": cmd_review}[a.cmd](a)
     except tm.TMError as e:
         print("swing: %s" % e, file=sys.stderr)
         return 1
