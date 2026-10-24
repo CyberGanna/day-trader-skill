@@ -169,6 +169,16 @@ candidate is not an edge until its own 95 % range is above zero. Short sales are
 simulated for the test only. `confluence.py context --symbols ...` prints the
 bias for the next session.
 
+**The confluence engine (`confluence.py engine`).** Phase 4: every bar where a
+signal fires, each signal and each context vote counts for 30 minutes (+1 with
+the side, -1 against). Two rules, both fitted on year 1 only: a count of
+agreeing votes (2 to 6) and a weighted score (each vote weighted by its year-1
+average R after costs when it agrees, the level picked from the score's
+quantiles). The level with the best year-1 average (at least 100 trades) is
+then run once on year 2. The gate: at least 100 year-2 trades, the 95 % range
+above zero and both halves positive. Only a rule that passes goes on to the
+shadow journal; say plainly when none does.
+
 **The seed.** The draws come from Python's `random.Random(seed)`, seed 19 by
 default. Same plan, same data, same seed: the same numbers, on any machine.
 Say the seed with every result so the user can repeat it.

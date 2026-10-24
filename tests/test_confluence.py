@@ -175,3 +175,41 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Engine(unittest.TestCase):
+    def test_a_vote_lasts_six_bars(self):
+        ev = {"fvg": [(5, 1), (20, -1)], "ma": []}
+        self.assertEqual(cf.votes_at(ev, 5), {"fvg": 1, "ma": 0})
+        self.assertEqual(cf.votes_at(ev, 10), {"fvg": 1, "ma": 0})
+        self.assertEqual(cf.votes_at(ev, 11), {"fvg": 0, "ma": 0})
+        self.assertEqual(cf.votes_at(ev, 21), {"fvg": -1, "ma": 0})
+
+    def cand(self, k, R, **x):
+        feats = {f: 0 for f in cf.FEATURES}
+        feats.update(x)
+        return {"k": k, "x": feats, "trade": {"R_net": R, "date": "2026-01-01", "time": "10:00"}}
+
+    def test_weights_first_trades_and_the_gate(self):
+        good = [{"cands": [self.cand(5, 1.0, fvg=1), self.cand(6, -1.0, fvg=-1)]} for _ in range(40)]
+        w = cf.learn_weights(good)
+        self.assertEqual(w["fvg"], 1.0)                 # agrees: +1 against an average of 0
+        self.assertEqual(w["ma"], 0.0)                  # never agreed 30 times: no weight
+        day = {"cands": [self.cand(5, -1.0, fvg=1), self.cand(9, 2.0, fvg=1, ma=1)]}
+        self.assertEqual(cf.first_trades([day], lambda x: sum(x.values()), 2), [day["cands"][1]["trade"]])
+        self.assertFalse(cf.gate({"trades": 50, "ci95_net": [0.1, 0.3], "halves_R_net": [0.2, 0.2]}))
+        self.assertTrue(cf.gate({"trades": 150, "ci95_net": [0.01, 0.3], "halves_R_net": [0.1, 0.2]}))
+        self.assertFalse(cf.gate({"trades": 150, "ci95_net": [0.01, 0.3], "halves_R_net": [-0.1, 0.4]}))
+
+    def test_engine_on_the_fixture(self):
+        saved = cf.MIN_TRAIN
+        cf.MIN_TRAIN = 5
+        try:
+            code, out, err = run(["engine", "--symbols", "TSLA", "--offline", DIR, "--now", AFTER,
+                                  "--warmup", "20", "--config", "none.json"])
+        finally:
+            cf.MIN_TRAIN = saved
+        self.assertEqual(code, 0, err)
+        self.assertIn("Confluence engine (phase 4)", out)
+        self.assertIn("count of agreeing votes", out)
+        self.assertIn("Weights learned on year 1", out)

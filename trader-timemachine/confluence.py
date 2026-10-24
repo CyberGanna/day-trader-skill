@@ -499,6 +499,168 @@ def lab_report(doc):
     return out
 
 
+# ---------------------------------------------------------------- phase 4: the confluence engine
+
+STATE_BARS = 6                        # a signal's vote lasts 30 minutes after it fires
+FEATURES = SIGNALS + ("D", "H4", "H1")
+VOTE_LEVELS = (2, 3, 4, 5, 6)
+SCORE_QUANTILES = (0.80, 0.90, 0.95, 0.98)
+MIN_TRAIN, GATE_TRADES = 100, 100
+
+
+def votes_at(events, k):
+    """Each signal's vote at bar k: the side of its last firing in the STATE_BARS bars up to k."""
+    v = {}
+    for name, ev in events.items():
+        last = 0
+        for kk, side in ev:
+            if kk > k:
+                break
+            if k - kk < STATE_BARS:
+                last = side
+        v[name] = last
+    return v
+
+
+def engine_samples(sym, sessions, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WARMUP):
+    """Every bar where a signal fires, both sides: the votes as seen from that side
+    (+1 agrees, -1 disagrees) and the trade it would have made. Grouped by day."""
+    X = indicators(sessions)
+    days = []
+    for i in range(max(1, warmup), len(sessions)):
+        d, D = sessions[i]
+        ctx = context(sessions[:i])
+        base = i * tm.SESSION_BARS
+        events = {name: [e for e in GENERATORS[name](X, base, D, sessions[i - 1][1])] for name in SIGNALS}
+        bars = sorted({k for ev in events.values() for k, _ in ev if FIRST <= k <= LAST_ENTRY})
+        cands = []
+        for k in bars:
+            v = votes_at(events, k)
+            v.update({"D": ctx["D"], "H4": ctx["H4"], "H1": ctx["H1"]})
+            for side in (1, -1):
+                t = trade(D, k, side, stop_atr * X["atr"][base + k], target_r, costs)
+                if t:
+                    t.update({"symbol": sym, "date": d})
+                    cands.append({"k": k, "x": {f: v[f] * side for f in FEATURES}, "trade": t})
+        days.append({"symbol": sym, "date": d, "cands": cands})
+    return days
+
+
+def first_trades(days, score, level):
+    """One trade a stock a day: the first candidate whose score reaches the level."""
+    out = []
+    for day in days:
+        hit = next((c for c in day["cands"] if score(c["x"]) >= level), None)
+        if hit:
+            out.append(hit["trade"])
+    return out
+
+
+def avg_net(trades):
+    return statistics.mean(t["R_net"] for t in trades) if trades else None
+
+
+def learn_weights(days):
+    """Each vote's weight from the training days only: the average R after costs when
+    it agrees with the side, minus the average over every candidate."""
+    rows = [c for d in days for c in d["cands"]]
+    if not rows:
+        return {f: 0.0 for f in FEATURES}
+    overall = statistics.mean(c["trade"]["R_net"] for c in rows)
+    w = {}
+    for f in FEATURES:
+        agree = [c["trade"]["R_net"] for c in rows if c["x"][f] == 1]
+        w[f] = round(statistics.mean(agree) - overall, 4) if len(agree) >= tm.MIN_TRADES else 0.0
+    return w
+
+
+def pick(train, score, levels):
+    """The level with the best average on the training days (at least MIN_TRAIN trades)."""
+    best = None
+    for lv in levels:
+        tr = first_trades(train, score, lv)
+        if len(tr) >= MIN_TRAIN and (best is None or avg_net(tr) > best[1]):
+            best = (lv, avg_net(tr), len(tr))
+    return best
+
+
+def gate(st):
+    """Phase 4's gate on the test year: enough trades, the 95 % range above zero, both halves positive."""
+    if st["trades"] < GATE_TRADES:
+        return False
+    return st["ci95_net"][0] > 0 and min(st["halves_R_net"]) > 0
+
+
+def engine(charts, now_utc, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WARMUP):
+    days, per, failed = [], {}, {}
+    for sym, text in charts.items():
+        try:
+            sessions = sessions_of(text, sym, now_utc)
+        except tm.TMError as e:
+            failed[sym] = str(e)
+            continue
+        if len(sessions) <= warmup:
+            failed[sym] = "%d full sessions: the context needs more than %d" % (len(sessions), warmup)
+            continue
+        ds = engine_samples(sym, sessions, costs, target_r, stop_atr, warmup)
+        days += ds
+        per[sym] = {"sessions": len(sessions), "tested_days": len(ds)}
+    if not days:
+        raise tm.TMError("no stock had enough history: " + "; ".join("%s: %s" % kv for kv in failed.items()))
+    cut = split_date([d["date"] for d in days])
+    train = [d for d in days if d["date"] < cut]
+    test = [d for d in days if d["date"] >= cut]
+    rules = []
+    count = lambda x: sum(x.values())  # noqa: E731
+    w = learn_weights(train)
+    weighted = lambda x: sum(w[f] * x[f] for f in FEATURES)  # noqa: E731
+    scores = sorted(weighted(c["x"]) for d in train for c in d["cands"])
+    levels = sorted({round(tm.pct(scores, q), 4) for q in SCORE_QUANTILES}) if scores else []
+    for name, score, lvls in (("votes", count, VOTE_LEVELS), ("weighted", weighted, levels)):
+        best = pick(train, score, lvls)
+        if not best:
+            rules.append({"rule": name, "level": None})
+            continue
+        trades = sorted(first_trades(test, score, best[0]), key=lambda t: (t["date"], t["time"]))
+        st = tm.backtest_stats(trades)
+        rules.append({"rule": name, "level": best[0], "train_avg": round(best[1], 3), "train_trades": best[2],
+                      "test": st, "passes": gate(st)})
+    return {"split": cut, "target_r": target_r, "stop_atr": stop_atr, "costs": dict(costs), "symbols": per,
+            "failed": failed, "weights": w, "rules": rules, "state_bars": STATE_BARS}
+
+
+def engine_report(doc):
+    out = ["Confluence engine (phase 4): %d stocks, %s, stop %g ATR, target %gR, out at 15:55."
+           % (len(doc["symbols"]), tm.cost_words(doc["costs"]), doc["stop_atr"], doc["target_r"]),
+           "Trained on year 1 (before %s), judged once on year 2. A vote lasts %d bars (30 minutes)."
+           % (doc["split"], doc["state_bars"]), "",
+           "Weights learned on year 1 (R after costs when the vote agrees, against the average):"]
+    for f, v in sorted(doc["weights"].items(), key=lambda kv: -kv[1]):
+        out.append("  %-34s %+.3f" % (NAMES.get(f, "context " + f), v))
+    out += ["", "  %-34s %-9s %10s %8s %8s  %-17s %s" % ("rule", "level", "year 1 avg", "trades", "year 2",
+                                                         "95 % range", "gate")]
+    words = {"votes": "count of agreeing votes", "weighted": "weighted score"}
+    for r in doc["rules"]:
+        if r["level"] is None:
+            out.append("  %-34s never reached %d trades on year 1" % (words[r["rule"]], MIN_TRAIN))
+            continue
+        st = r["test"]
+        if not st["trades"]:
+            out.append("  %-34s %-9g %+10.3f %8d %8s" % (words[r["rule"]], r["level"], r["train_avg"], 0, "-"))
+            continue
+        lo, hi = st.get("ci95_net", (0, 0))
+        out.append("  %-34s %-9g %+10.3f %8d %+8.3f  %+.3f to %+.3f %s" % (
+            words[r["rule"]], r["level"], r["train_avg"], st["trades"], st["avg_R_net"], lo, hi,
+            "PASSES" if r["passes"] else "fails"))
+    out.append("")
+    out.append("The gate (year 2 only): at least %d trades, the 95 %% range above zero, both halves positive. "
+               "Only a rule that passes goes on to the shadow journal." % GATE_TRADES)
+    if doc["failed"]:
+        out.append("Skipped: " + "; ".join("%s (%s)" % kv for kv in sorted(doc["failed"].items())))
+    out.append("Education and tooling, not financial advice. Nothing here places an order.")
+    return out
+
+
 # ---------------------------------------------------------------- the commands
 
 def load_charts(a, rng):
@@ -538,6 +700,19 @@ def cmd_backtest(a):
     return 0
 
 
+def cmd_engine(a):
+    if not a.target_r > 0 or not a.stop_atr > 0:
+        raise tm.TMError("--target-r and --stop-atr must be more than 0")
+    if not a.offline and tm.data_source() != "alpaca":
+        raise tm.TMError("the engine needs years of bars: use --offline with a folder that backtest --save wrote, "
+                         "or set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET")
+    charts, failed = load_charts(a, a.range)
+    doc = engine(charts, tm.parse_now(a.now), tm.load_costs(a), a.target_r, a.stop_atr, a.warmup)
+    doc["failed"].update(failed)
+    print(json.dumps(doc, indent=2) if a.json else "\n".join(engine_report(doc)))
+    return 0
+
+
 def cmd_context(a):
     if not a.offline and tm.data_source() != "alpaca":
         raise tm.TMError("the context needs 6 months of bars: use --offline, or set the Alpaca keys")
@@ -574,6 +749,7 @@ def main(argv=None):
                                              "tested against random entries (trader-timemachine).")
     sub = ap.add_subparsers(dest="cmd")
     for name, help_ in (("backtest", "test each signal alone and with the context"),
+                        ("engine", "combine the votes: learn on year 1, judge on year 2"),
                         ("context", "the D/H4/H1 bias for the next session")):
         p = sub.add_parser(name, help=help_)
         p.add_argument("--symbols", help="tickers, comma separated")
@@ -581,7 +757,7 @@ def main(argv=None):
         p.add_argument("--offline", help="a folder of <SYM>-<range>5m.json.gz files (backtest --save writes them)")
         p.add_argument("--now", help="the time to read the data at, YYYY-MM-DD HH:MM New York (default: now)")
         p.add_argument("--json", action="store_true", help="print the numbers as JSON")
-        if name == "backtest":
+        if name in ("backtest", "engine"):
             p.add_argument("--range", default="2y", choices=tm.RANGES[1:], help="history to fetch from Alpaca (2y)")
             p.add_argument("--target-r", type=float, default=TARGET_R, help="target in R (%g)" % TARGET_R)
             p.add_argument("--stop-atr", type=float, default=STOP_ATR, help="stop distance in 5-minute ATRs (%g)" % STOP_ATR)
@@ -589,6 +765,7 @@ def main(argv=None):
             p.add_argument("--commission", type=float, help="commission a share a side in $ (default %g)" % tm.COMMISSION)
             p.add_argument("--config", default="trader/config.json", help="costs from here when the flags are not given")
             p.add_argument("--warmup", type=int, default=WARMUP, help="sessions read before the first tested day (%d)" % WARMUP)
+        if name == "backtest":
             p.add_argument("--signals", help="only these, comma separated (default all): " + ",".join(SIGNALS))
             p.add_argument("--seed", type=int, default=SEED, help="seed of the random entries (%d)" % SEED)
     a = ap.parse_args(argv)
@@ -596,7 +773,7 @@ def main(argv=None):
         ap.print_help()
         return 1
     try:
-        return cmd_backtest(a) if a.cmd == "backtest" else cmd_context(a)
+        return {"backtest": cmd_backtest, "engine": cmd_engine, "context": cmd_context}[a.cmd](a)
     except tm.TMError as e:
         print("confluence: %s" % e, file=sys.stderr)
         return 1
