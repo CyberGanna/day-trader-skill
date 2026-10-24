@@ -34,6 +34,7 @@ Only the standard library. GET only, to https://data.alpaca.markets.
 import datetime
 import json
 import os
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -50,7 +51,9 @@ RANGES = {"1d": (6, 1), "5d": (12, 5), "1mo": (31, None), "60d": (60, None), "3m
 SNAP_MAX = 100       # symbols per snapshots request
 PAGE = 10000
 
-_urlopen = urllib.request.urlopen   # tests swap these two
+_urlopen = urllib.request.urlopen   # tests swap these three
+_sleep = time.sleep
+RETRIES_429, WAIT_429 = 4, 15   # a long backtest can pass Alpaca's 200 requests a minute
 
 
 def _now():
@@ -130,6 +133,22 @@ def _parse_t(text):
 # ---------------------------------------------------------------- HTTP
 
 def _get(path, params):
+    """One GET. HTTP 429 (too many requests) waits WAIT_429 seconds and tries again, up to
+    RETRIES_429 times, so a long backtest slows down instead of failing."""
+    for attempt in range(RETRIES_429 + 1):
+        try:
+            return _get_once(path, params)
+        except _RateLimited:
+            if attempt == RETRIES_429:
+                raise AlpacaError("Alpaca is rate limiting (HTTP 429). Wait a minute and run it again.")
+            _sleep(WAIT_429)
+
+
+class _RateLimited(Exception):
+    pass
+
+
+def _get_once(path, params):
     k = keys()
     if not k:
         raise AlpacaError("no Alpaca keys in the environment: set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET "
@@ -155,7 +174,7 @@ def _get(path, params):
                     else "Alpaca's plan does not include this data (HTTP 403): set ALPACA_FEED=auto or iex")
             raise AlpacaError(hint)
         if e.code == 429:
-            raise AlpacaError("Alpaca is rate limiting (HTTP 429). Wait a minute and run it again.")
+            raise _RateLimited()
         raise AlpacaError("Alpaca answered HTTP %d: %s" % (e.code, body.strip() or "no detail"))
     except (urllib.error.URLError, OSError) as e:
         raise AlpacaError("could not reach Alpaca: %s" % getattr(e, "reason", e))
@@ -236,6 +255,8 @@ def _result(ysym, interval, rows, keep, snap=None):
         t = _parse_t(b["t"])
         day = eastern_date(t)
         ts = eastern_to_epoch(day, 9, 30) if daily else int(t.timestamp())
+        if not daily and not eastern_to_epoch(day, 9, 30) <= ts < eastern_to_epoch(day, 16, 0):
+            continue   # Alpaca includes pre- and post-market bars; Yahoo's default chart does not
         stamped.append((day, ts, b))
     prev_close = None
     if keep:

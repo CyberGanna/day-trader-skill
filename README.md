@@ -135,6 +135,7 @@ python3 trader-entry/entry.py watch TSLA --every 30                    # bar by 
 python3 trader-exit/exit.py plan --stop or-mid --target 1R --write     # -> trader/plan.json
 python3 trader-timemachine/timemachine.py run --write                  # 10,000 replays + the history
 python3 trader-timemachine/timemachine.py backtest --symbols TSLA,NVDA  # the rule on many stocks, after costs
+python3 trader-timemachine/timemachine.py backtest --symbols TSLA,NVDA --range 2y --compare  # 2 years (Alpaca), filters and exits side by side
 python3 trader-budget/size.py --write                                  # -> trader/orders.json
 python3 trader-risk/check.py                                           # PASS / BLOCK per order
 python3 trader-broker/ticket.py show                                   # the tickets, READY or not

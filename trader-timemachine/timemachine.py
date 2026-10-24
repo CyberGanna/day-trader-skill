@@ -216,9 +216,12 @@ def clock24(minutes):
 
 # ---------------------------------------------------------------- data
 
-def chart_url(sym, host="query2"):
-    return "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=60d&interval=5m" % (
-        host, urllib.parse.quote(sym.upper().replace(".", "-")))
+RANGES = ("60d", "6mo", "1y", "2y")   # 5-minute history: Yahoo keeps 60d, Alpaca years
+
+
+def chart_url(sym, host="query2", rng="60d"):
+    return "https://%s.finance.yahoo.com/v8/finance/chart/%s?range=%s&interval=5m" % (
+        host, urllib.parse.quote(sym.upper().replace(".", "-")), rng)
 
 
 def _sleep(seconds):
@@ -231,11 +234,15 @@ def _get(url, timeout=20):
         return r.read().decode("utf-8", "replace")
 
 
-def fetch_chart(sym):
+def fetch_chart(sym, rng="60d"):
     """One request for 60 days of 5-min bars. query2 first, one retry after a 429,
-    then query1 on 429 or 5xx. With Alpaca as the source, one Alpaca request instead."""
+    then query1 on 429 or 5xx. With Alpaca as the source, one Alpaca request instead,
+    and a longer --range (6mo, 1y, 2y) too."""
     if data_source() == "alpaca":
-        return alpaca_answer(chart_url(sym), TMError)
+        return alpaca_answer(chart_url(sym, rng=rng), TMError)
+    if rng != "60d":
+        raise TMError("Yahoo keeps 60 days of 5-minute bars: a %s range needs Alpaca's data "
+                      "(set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET)" % rng)
     last = None
     for n, host in enumerate(HOSTS):
         if n:
@@ -268,14 +275,15 @@ def fetch_chart(sym):
 
 
 def read_offline(path, sym):
-    """A saved Yahoo chart file (.json or .json.gz), or a folder holding <SYM>-60d5m.json(.gz)."""
+    """A saved Yahoo chart file (.json or .json.gz), or a folder holding <SYM>-<range>5m.json(.gz)
+    (60d first, then the longer ranges that backtest --save writes)."""
     if os.path.isdir(path):
-        for name in ("%s-60d5m.json" % sym.upper(), "%s-60d5m.json.gz" % sym.upper()):
+        for name in ["%s-%s5m.json%s" % (sym.upper(), r, gz) for r in RANGES for gz in ("", ".gz")]:
             if os.path.exists(os.path.join(path, name)):
                 path = os.path.join(path, name)
                 break
         else:
-            raise TMError("no %s-60d5m.json(.gz) in %s" % (sym.upper(), path))
+            raise TMError("no %s-60d5m.json(.gz) (or a longer range) in %s" % (sym.upper(), path))
     if not os.path.exists(path):
         raise TMError("no offline chart file %s" % path)
     opener = gzip.open if path.endswith(".gz") else open
@@ -506,15 +514,22 @@ def rule_stop(rule, oh, ol, entry, long):
     return cents_away(entry * (1 - frac) if long else entry * (1 + frac), long)
 
 
-def history_replay(sessions, rule, last, side="buy", costs=None):
+def history_replay(sessions, rule, last, side="buy", costs=None, allow=None):
     """The plan's rule on every past full session: entry = the first bar after the
     opening range to close beyond it (up to the --until bar), then stop first, then
     target, bar by bar, else the close at --until. R_net fills a stop at the open
-    of a bar that gaps through it and takes off the costs."""
+    of a bar that gaps through it and takes off the costs.
+    Optional exits in the rule: breakeven_r moves the stop to the entry once a bar
+    reaches entry + that many R (from the next bar on); half_r sells half there and
+    the rest runs to the stop, the target or the close. allow = the session dates
+    the filters let through (None = all)."""
     long = side == "buy"
     n = rule["or_minutes"] // 5
+    be_r, half_r = rule.get("breakeven_r"), rule.get("half_r")
     trades = []
     for d, D in sessions:
+        if allow is not None and d not in allow:
+            continue
         oh, ol = opening_range(D, n)
         kk = next((i for i in range(n, last + 1) if (D[i]["c"] > oh if long else D[i]["c"] < ol)), None)
         if kk is None:
@@ -525,23 +540,28 @@ def history_replay(sessions, rule, last, side="buy", costs=None):
         if risk <= 0:
             continue
         t = round(e + rule["target_r"] * risk, 2) if long else round(e - rule["target_r"] * risk, 2)
-        oc, R_stop = None, -1.0
+        gain = (lambda p: (p - e) / risk) if long else (lambda p: (e - p) / risk)
+        reached = (lambda b, p: b["h"] >= p) if long else (lambda b, p: b["l"] <= p)
+        cur, half, oc, R_stop, R_fill = s, None, None, -1.0, -1.0
         for b in D[kk + 1:last + 1]:
-            if (b["l"] <= s) if long else (b["h"] >= s):
+            if (b["l"] <= cur) if long else (b["h"] >= cur):
                 oc = "stop"
-                f = stop_fill(s, b["o"], long)
-                R_stop = ((f - e) if long else (e - f)) / risk
+                R_stop, R_fill = gain(cur), gain(stop_fill(cur, b["o"], long))
                 break
-            if (b["h"] >= t) if long else (b["l"] <= t):
+            if half_r and half is None and reached(b, e + half_r * risk if long else e - half_r * risk):
+                half = float(half_r)
+            if reached(b, t):
                 oc = "target"
                 break
-        cl = D[last]["c"]
-        R = ((t - e) if long else (e - t)) / risk if oc == "target" else -1.0 if oc == "stop" else \
-            ((cl - e) if long else (e - cl)) / risk
-        R_net = (R_stop if oc == "stop" else R) - cost_r(e, risk, costs)
+            if be_r and reached(b, e + be_r * risk if long else e - be_r * risk):
+                cur = max(cur, e) if long else min(cur, e)
+        rest = gain(t) if oc == "target" else R_stop if oc == "stop" else gain(D[last]["c"])
+        rest_fill = R_fill if oc == "stop" else rest
+        R = rest if half is None else (half + rest) / 2
+        R_net = (rest_fill if half is None else (half + rest_fill) / 2) - cost_r(e, risk, costs)
         trades.append({"date": d, "time": clock12(OPEN_MIN + 5 * (kk + 1)), "entry": e, "stop": s, "target": t,
                        "outcome": oc or "close", "R": round(R, 2), "R_net": round(R_net, 2),
-                       "gapped": oc == "stop" and R_stop < -1.0})
+                       "gapped": oc == "stop" and R_fill < R_stop})
     return {
         "sessions": len(sessions), "triggered": len(trades),
         "target": sum(1 for x in trades if x["outcome"] == "target"),
@@ -856,16 +876,59 @@ def cost_words(costs):
 
 # ---------------------------------------------------------------- backtest
 
-def backtest(charts, rule, now_utc, until=None, costs=None, side="buy"):
+RVOL_LOOKBACK, RVOL_MIN_HISTORY = 20, 10
+
+
+def market_closes(text, now_utc):
+    """SPY's (or any index's) chart -> [(date, close)] of its full sessions, oldest first."""
+    _, bars, _ = parse_bars(chart_result(text, "SPY"), now_utc)
+    sessions, _ = full_sessions(split_sessions(bars), "9999-12-31")
+    return [(d, D[-1]["c"]) for d, D in sessions]
+
+
+def session_filter(sessions, rule, closes=None):
+    """The session dates the rule's filters let through, or None when it has none.
+    min_rvol: the opening range's volume is at least that many times its average over
+    the previous 20 sessions (10 at least). spy_trend: the market's last close BEFORE
+    the session is above its own N-session average. Both use only what is known at
+    the entry: no look-ahead."""
+    spy_n, rvol = rule.get("spy_trend"), rule.get("min_rvol")
+    if not spy_n and not rvol:
+        return None
+    ok = {d for d, _ in sessions}
+    if rvol:
+        n = rule["or_minutes"] // 5
+        vols = [(d, sum(D[i]["v"] for i in range(n))) for d, D in sessions]
+        keep = set()
+        for i, (d, v) in enumerate(vols):
+            prev = [x for _, x in vols[max(0, i - RVOL_LOOKBACK):i]]
+            if len(prev) >= RVOL_MIN_HISTORY and statistics.mean(prev) > 0 and v >= rvol * statistics.mean(prev):
+                keep.add(d)
+        ok &= keep
+    if spy_n:
+        if not closes:
+            raise TMError("the market-trend filter needs SPY's bars, and there are none")
+        keep = set()
+        for d in ok:
+            prev = [c for dd, c in closes if dd < d][-spy_n:]
+            if len(prev) == spy_n and prev[-1] > statistics.mean(prev):
+                keep.add(d)
+        ok &= keep
+    return ok
+
+
+def backtest(charts, rule, now_utc, until=None, costs=None, side="buy", market=None):
     """{SYM: chart JSON text} + an orb rule -> the backtest document. The rule runs on
     every full session in each chart (today too, once it is complete): the same
-    history replay the run uses, with the costs."""
+    history replay the run uses, with the costs. market = SPY's chart text, for the
+    rule's spy_trend filter."""
     until_min = CLOSE_MIN if until is None else parse_clock(until, "--until")
     if (until_min - OPEN_MIN) % 5 or until_min > CLOSE_MIN:
         raise TMError("--until must be on the 5-minute grid and no later than 4:00 PM")
     last = (until_min - OPEN_MIN) // 5 - 1
     if last < rule["or_minutes"] // 5:
         raise TMError("--until %s ends before the opening range does" % clock12(until_min))
+    closes = market_closes(market, now_utc) if market and rule.get("spy_trend") else None
     per, trades, failed = [], [], {}
     for sym in sorted(charts):
         try:
@@ -874,7 +937,7 @@ def backtest(charts, rule, now_utc, until=None, costs=None, side="buy"):
             failed[sym] = str(e)
             continue
         sessions, _ = full_sessions(split_sessions(bars), "9999-12-31")
-        h = history_replay(sessions, rule, last, side, costs)
+        h = history_replay(sessions, rule, last, side, costs, session_filter(sessions, rule, closes))
         for t in h["trades"]:
             trades.append(dict(t, symbol=sym))
         per.append({"symbol": sym, "sessions": h["sessions"], "triggered": h["triggered"],
@@ -915,6 +978,8 @@ def backtest_stats(trades):
         "profit_factor_net": round(wins / losses, 2) if losses else None,
         "total_R_net": round(sum(net), 2), "max_drawdown_R": round(dd, 2),
         "gap_stops": sum(1 for t in trades if t.get("gapped")),
+        "halves_R_net": [round(statistics.mean(net[:n // 2]), 3) if n > 1 else None,
+                         round(statistics.mean(net[n // 2:]), 3)],
     })
     lo, hi = st["ci95_net"]
     if n < MIN_TRADES:
@@ -936,13 +1001,38 @@ def usd(x):
     return "%s$%.2f" % ("-" if x < 0 else "+", abs(x))
 
 
+def rule_extras(ru):
+    """The rule's filters and exits in words, or []."""
+    out = []
+    if ru.get("spy_trend"):
+        out.append("only when SPY closed above its %d-day average the day before" % ru["spy_trend"])
+    if ru.get("min_rvol"):
+        out.append("only when the opening range traded at least %gx its usual volume" % ru["min_rvol"])
+    if ru.get("half_r"):
+        out.append("half sold at %gR" % ru["half_r"])
+    if ru.get("breakeven_r"):
+        out.append("stop to the entry once %gR is reached" % ru["breakeven_r"])
+    return out
+
+
+def data_note(doc):
+    rng = doc.get("range", "60d")
+    if rng == "60d":
+        return ("Yahoo keeps about 60 days of 5-minute bars, so this is a few months at most. "
+                "Alpaca's data (backtest --range 1y or 2y) goes back years.")
+    return "History: %s of 5-minute bars from Alpaca." % rng
+
+
 def backtest_report(doc, max_loss=None):
     ru, st = doc["rule"], doc["stats"]
     stop_words = {"or_mid": "the opening-range midpoint", "or_low": "the opening-range low"}.get(
         ru["stop_rule"], "%.2f %% under the entry" % ru.get("stop_pct", 0))
     lines = ["Backtest: %d-min opening-range breakout, buy, stop at %s, %gR target, out by %s."
              % (ru["or_minutes"], stop_words, ru["target_r"], clock12(int(doc["until"][:2]) * 60 + int(doc["until"][3:]))),
-             "Costs: %s; a stop that gaps fills at the open." % cost_words(doc["costs"]), ""]
+             "Costs: %s; a stop that gaps fills at the open." % cost_words(doc["costs"])]
+    if rule_extras(ru):
+        lines.append("Also: %s." % "; ".join(rule_extras(ru)))
+    lines.append("")
     if doc["symbols"]:
         lines.append("  symbol  sessions  fired  target  stop  neither   avg R   after costs")
         for p in doc["symbols"]:
@@ -963,14 +1053,74 @@ def backtest_report(doc, max_loss=None):
                "" if st["profit_factor_net"] is None else ", profit factor %.2f" % st["profit_factor_net"]),
         ]
         if st["gap_stops"]:
-            lines.append("  %d stop(s) gapped through and filled worse than -1 R." % st["gap_stops"])
+            lines.append("  %d stop(s) gapped through and filled worse than the stop." % st["gap_stops"])
+        h1, h2 = st.get("halves_R_net") or [None, None]
+        if h1 is not None:
+            lines.append("  First half of the trades %+.3f R, second half %+.3f R: an edge should show in both."
+                         % (h1, h2))
         if max_loss:
             lines.append("  At $%g risked a trade: about %s a trade on average, %s in total, worst drawdown $%.2f."
                          % (max_loss, usd(st["avg_R_net"] * max_loss), usd(st["total_R_net"] * max_loss),
                             st["max_drawdown_R"] * max_loss))
-    lines += ["", st["verdict"],
-              "Yahoo keeps about 60 days of 5-minute bars, so this is a few months at most. "
-              "Past results do not promise future ones. Education and tooling, not financial advice."]
+    lines += ["", st["verdict"], data_note(doc) +
+              " Past results do not promise future ones. Education and tooling, not financial advice."]
+    return lines
+
+
+VARIANTS = (
+    ("as given", {}),
+    ("+ SPY above its 20-day average", {"spy_trend": 20}),
+    ("+ opening volume >= 1.5x usual", {"min_rvol": 1.5}),
+    ("+ both filters", {"spy_trend": 20, "min_rvol": 1.5}),
+    ("target 2R", {"target_r": 2.0}),
+    ("target 2R, stop to entry at 1R", {"target_r": 2.0, "breakeven_r": 1.0}),
+    ("half at 1R, rest 2R, stop to entry", {"target_r": 2.0, "half_r": 1.0, "breakeven_r": 1.0}),
+)
+
+
+def compare(charts, rule, now_utc, until=None, costs=None, market=None):
+    """The same data through each variant of the rule: filters and exits side by side."""
+    rows = []
+    for label, extra in VARIANTS:
+        ru = dict(rule, **extra)
+        if ru.get("spy_trend") and not market:
+            continue
+        doc = backtest(charts, ru, now_utc, until, costs, market=market)
+        rows.append({"variant": label, "rule": ru, "stats": doc["stats"]})
+    base = backtest(charts, rule, now_utc, until, costs)
+    return {"created_by": "trader-timemachine backtest --compare", "created_at": base["created_at"],
+            "until": base["until"], "costs": base["costs"], "symbols": [p["symbol"] for p in base["symbols"]],
+            "failed": base["failed"], "variants": rows}
+
+
+def short_verdict(st):
+    if st["trades"] < MIN_TRADES:
+        return "too few"
+    lo, hi = st["ci95_net"]
+    return "EDGE" if lo > 0 else "loses" if hi < 0 else "no proof"
+
+
+def compare_report(doc, max_loss=None):
+    lines = ["Backtest compare: %d stocks, out by %s, costs %s." % (
+        len(doc["symbols"]), doc["until"], cost_words(doc["costs"])), "",
+        "  %-36s %6s %8s  %-17s %8s %8s  %s" % ("variant", "trades", "avg R", "95 % range", "1st half",
+                                                "2nd half", "verdict")]
+    for r in doc["variants"]:
+        st = r["stats"]
+        if not st["trades"]:
+            lines.append("  %-36s %6d" % (r["variant"], 0))
+            continue
+        h1, h2 = st["halves_R_net"]
+        lines.append("  %-36s %6d %+8.3f  %+.3f to %+.3f %8s %+8.3f  %s" % (
+            r["variant"], st["trades"], st["avg_R_net"], st["ci95_net"][0], st["ci95_net"][1],
+            "-" if h1 is None else "%+.3f" % h1, h2, short_verdict(st)))
+    for sym, why in sorted(doc["failed"].items()):
+        lines.append("Skipped %s: %s" % (sym, why))
+    lines += ["", "R after costs. %d variants on the same data: the best of them is partly luck. Trust one only if "
+              "its 95 %% range stays above zero AND both halves are positive." % len(doc["variants"]),
+              data_note(doc) + " Education and tooling, not financial advice."]
+    if max_loss:
+        lines.insert(-2, "At $%g risked a trade, +0.100 R a trade is about $%.2f." % (max_loss, 0.1 * max_loss))
     return lines
 
 
@@ -1171,20 +1321,55 @@ def cmd_backtest(a):
         if not a.stop_pct or not 0 < a.stop_pct < 50:
             raise TMError("--stop-rule pct needs --stop-pct, e.g. 1.5")
         rule["stop_pct"] = a.stop_pct
+    for key in ("spy_trend", "min_rvol", "half_r", "breakeven_r"):
+        val = getattr(a, key, None)
+        if val is not None:
+            if not val > 0:
+                raise TMError("--%s must be more than 0" % key.replace("_", "-"))
+            rule[key] = val
+    if rule.get("half_r") and rule["half_r"] >= rule["target_r"]:
+        raise TMError("--half-r must be below --target-r")
+    if a.range != "60d" and not a.offline and data_source() != "alpaca":
+        raise TMError("--range %s needs Alpaca's data: set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET" % a.range)
     costs = load_costs(a)
-    charts, failed = {}, {}
-    for n, sym in enumerate(backtest_symbols(a)):
+    want_market = a.compare or rule.get("spy_trend")
+    charts, failed, market = {}, {}, None
+    symbols = backtest_symbols(a)
+    for n, sym in enumerate(symbols + (["SPY"] if want_market and "SPY" not in symbols else [])):
         try:
             if a.offline:
-                charts[sym] = read_offline(a.offline, sym)
+                text = read_offline(a.offline, sym)
             else:
                 if n:
                     _sleep(PAUSE)
-                charts[sym] = fetch_chart(sym)
+                text = fetch_chart(sym, a.range)
+                if a.save:
+                    os.makedirs(a.save, exist_ok=True)
+                    with gzip.open(os.path.join(a.save, "%s-%s5m.json.gz" % (sym, a.range)), "wt",
+                                   encoding="utf-8") as fh:
+                        fh.write(text)
         except TMError as e:
-            failed[sym] = str(e)
-    doc = backtest(charts, rule, now, a.until, costs)
+            if sym in symbols:
+                failed[sym] = str(e)
+            continue
+        if sym == "SPY":
+            market = text
+        if sym in symbols:
+            charts[sym] = text
+    if a.compare:
+        doc = compare(charts, rule, now, a.until, costs, market)
+        doc["failed"].update(failed)
+        doc["range"] = a.range
+        if a.write:
+            _write(a.write, doc)
+        if a.json:
+            print(json.dumps(doc, indent=2))
+        else:
+            print("\n".join(compare_report(doc, a.max_loss)))
+        return 0
+    doc = backtest(charts, rule, now, a.until, costs, market=market)
     doc["failed"].update(failed)
+    doc["range"] = a.range
     if a.write:
         _write(a.write, doc)
     if a.json:
@@ -1255,6 +1440,16 @@ def main(argv=None):
                                                    "(default max_loss_per_trade_usd in the config)")
     p.add_argument("--offline", metavar="DIR", help="a folder of saved charts, <SYM>-60d5m.json(.gz)")
     p.add_argument("--now", help='pretend it is this time ("2026-10-19 16:00" New York)')
+    p.add_argument("--range", default="60d", choices=RANGES,
+                   help="history of 5-minute bars (default 60d; 6mo, 1y, 2y need Alpaca's data)")
+    p.add_argument("--save", metavar="DIR", help="also save each chart fetched, for --offline later")
+    p.add_argument("--spy-trend", type=int, metavar="N", help="only when SPY closed above its N-day average")
+    p.add_argument("--min-rvol", type=float, metavar="X",
+                   help="only when the opening range traded at least X times its usual volume")
+    p.add_argument("--half-r", type=float, metavar="R", help="sell half at R, the rest runs to the target")
+    p.add_argument("--breakeven-r", type=float, metavar="R", help="move the stop to the entry once R is reached")
+    p.add_argument("--compare", action="store_true",
+                   help="run the rule and its filter and exit variants side by side")
     cost_flags(p)
     p.add_argument("--json", action="store_true")
     p.add_argument("--write", nargs="?", const="trader/backtest.json", metavar="PATH",

@@ -123,6 +123,28 @@ ticker that fails is skipped and listed, it does not stop the run. Yahoo
 keeps about 60 days of 5-minute bars, so a backtest covers a few months at
 most: say so with the result.
 
+**Years of history with Alpaca.** With Alpaca's data (see below),
+`--range 6mo`, `1y` or `2y` replays that much history instead; Yahoo refuses
+it in one line. `--save DIR` keeps every chart fetched so later runs can use
+`--offline DIR` without asking Alpaca again. A rate limit (HTTP 429) waits 15
+seconds and tries again, up to four times.
+
+**Filters and exits.** `--spy-trend N` takes a trade only when SPY closed
+above its N-day average the day before; `--min-rvol X` only when the opening
+range traded at least X times its average over the previous 20 sessions.
+`--breakeven-r R` moves the stop to the entry once a bar reaches R (from the
+next bar on), `--half-r R` sells half there and lets the rest run to the
+target, the stop or the close. Both filters look only at what was known at the
+entry. Each run also prints the average R of the first and the second half of
+its trades: an edge should show in both.
+
+**Compare.** `--compare` runs the rule as given and six variants on the same
+data (each filter, both, a 2R target, 2R with the stop moved to the entry, half
+at 1R and the rest at 2R) and prints one row each: trades, average R after
+costs, its 95 % range, both halves and a one-word verdict. Say with it that the
+best of several variants is partly luck: trust one only when its whole 95 %
+range is above zero and both halves are positive.
+
 **The seed.** The draws come from Python's `random.Random(seed)`, seed 19 by
 default. Same plan, same data, same seed: the same numbers, on any machine.
 Say the seed with every result so the user can repeat it.
