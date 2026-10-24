@@ -179,6 +179,17 @@ then run once on year 2. The gate: at least 100 year-2 trades, the 95 % range
 above zero and both halves positive. Only a rule that passes goes on to the
 shadow journal; say plainly when none does.
 
+**The order flow lab (`orderflow.py`).** Phase 3. `orderflow.py download
+--symbols TSLA --days 20 --out flusso` reads every regular-session trade from
+Alpaca (`/v2/stocks/trades`, SIP history, GET only) and keeps one small file a
+stock a day: buying and selling volume per 5-minute bar by the tick rule, and
+the footprint (volume at each cent). A busy stock takes a minute or more a day.
+`orderflow.py backtest --symbols TSLA --flow flusso --offline storico` tests a
+CVD divergence at a new high or low, a breakout with strong delta, and
+absorption in the footprint, with the lab's exits, beside random entries, first
+half of the days against the second. Weeks of flow are a small sample: a signal
+that beats random there is a hint, not an edge.
+
 **The seed.** The draws come from Python's `random.Random(seed)`, seed 19 by
 default. Same plan, same data, same seed: the same numbers, on any machine.
 Say the seed with every result so the user can repeat it.
