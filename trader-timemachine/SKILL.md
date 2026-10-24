@@ -155,7 +155,13 @@ The context votes before the open, from earlier sessions only: the daily trend
 one way set the day's bias (buys only, sells only, or none). The signals on
 5-minute bars: EMA 9/21 cross, Ichimoku cloud break (9/26/52), a return into a
 fair value gap or an order block opened that day, a sweep of yesterday's low or
-high. All get the same exits (stop 1 ATR(14), target 2R, out at 15:55, costs
+high. Phase 2 adds yesterday's volume profile (50 price bins: the point of
+control, the 70 % value area, the thinnest bin on each side of the POC as the
+low volume nodes): back into value area after opening outside it, two closes
+outside it after opening inside, a close through a low volume node; and ICT in
+the 9:30-11:00 killzone (yesterday's low or high swept, then a fair value gap
+the other way, entered on the first return into it). `--signals fvg,ict` runs a
+few. All get the same exits (stop 1 ATR(14), target 2R, out at 15:55, costs
 off) and one trade a signal a stock a day, alone and with the context, beside
 seeded random entries with the same exits. A signal is a candidate only when it
 beats random in both years; say that 12 variants ran on the same data, so a

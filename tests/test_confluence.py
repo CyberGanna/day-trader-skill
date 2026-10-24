@@ -108,6 +108,38 @@ class Signals(unittest.TestCase):
         self.assertEqual(days, days2)                    # the last day's bars never move a context
 
 
+class Profile(unittest.TestCase):
+    def test_poc_and_value_area(self):
+        D = [bar(100, 100.1, 99.9, 100, 10000) for _ in range(50)]    # most volume at 100
+        D += [bar(100, 100.5, 99.5, 100, 2000) for _ in range(20)]
+        D += [bar(104, 105, 103, 104, 100) for _ in range(8)]          # a thin trip up to 105
+        p = cf.profile(D)
+        self.assertAlmostEqual(p["poc"], 100, delta=0.2)
+        self.assertLess(p["vah"], 101)
+        self.assertGreater(p["val"], 99)
+
+    def test_back_into_value_area_goes_toward_the_poc(self):
+        prev = [bar(100, 100.5, 99.5, 100, 10000) for _ in range(78)]
+        D = flat(103)                                                  # opens above value
+        D[4] = bar(102, 102, 100, 100.2)                               # first close back inside
+        self.assertEqual(list(cf.sig_va_return(None, 0, D, prev)), [(4, -1)])
+        self.assertEqual(list(cf.sig_va_return(None, 0, flat(100), prev)), [])   # opened inside
+
+    def test_ict_needs_the_sweep_before_the_gap(self):
+        prev = flat(100)                                               # yesterday's low 99.9
+        D = flat(100)
+        D[2] = bar(100, 100, 99.5, 99.8)                               # sweeps 99.9
+        D[3] = bar(99.8, 100.2, 99.7, 100.1)
+        D[4] = bar(100.1, 101, 100.3, 101)                             # low 100.3 > bar 2 high 100: a gap
+        D[5] = bar(101, 101.2, 100.2, 100.6)                           # back into it, closes above 100
+        for i in range(6, 78):
+            D[i] = bar(100.6, 100.7, 100.5, 100.6)
+        self.assertEqual(next(iter(cf.sig_ict(None, 0, D, prev))), (5, 1))
+        D[2] = bar(100, 100.05, 99.95, 100)                            # no sweep: no trade
+        D[3] = bar(99.95, 100.2, 99.95, 100.1)
+        self.assertEqual(list(cf.sig_ict(None, 0, D, prev)), [])
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.env = {k: os.environ.pop(k) for k in list(os.environ)
@@ -121,13 +153,13 @@ class Cli(unittest.TestCase):
                 "--config", "none.json"]
         code, out, err = run(argv)
         self.assertEqual(code, 0, err)
-        self.assertIn("Confluence lab, phase 1: 1 stocks", out)
+        self.assertIn("Confluence lab: 1 stocks", out)
         self.assertIn("With the D/H4/H1 context", out)
         self.assertIn("Beat random in both years:", out)
         a = json.loads(run(argv + ["--json"])[1])
         b = json.loads(run(argv + ["--json"])[1])
         self.assertEqual(a, b)                           # the random entries are seeded
-        self.assertEqual(len(a["rows"]), 12)
+        self.assertEqual(len(a["rows"]), 20)
 
     def test_context_and_the_data_it_needs(self):
         code, out, err = run(["context", "--symbols", "TSLA", "--offline", DIR, "--now", AFTER])
@@ -136,6 +168,9 @@ class Cli(unittest.TestCase):
         code, _, err = run(["backtest", "--symbols", "TSLA"])
         self.assertEqual(code, 1)
         self.assertIn("--offline", err)
+        code, _, err = run(["backtest", "--symbols", "TSLA", "--offline", DIR, "--signals", "fvg,nope"])
+        self.assertEqual(code, 1)
+        self.assertIn("unknown signal nope", err)
 
 
 if __name__ == "__main__":

@@ -45,9 +45,13 @@ import timemachine as tm  # noqa: E402
 FIRST, LAST_ENTRY, EXIT = 3, 66, 76   # bars: 9:45 close is the first entry, 15:05 the last, out at 15:55
 WARMUP = 55                           # sessions before the first tested day: the 50-day average needs them
 TARGET_R, STOP_ATR = 2.0, 1.0
-SIGNALS = ("ma", "ichimoku", "fvg", "ob", "sweep")
+SIGNALS = ("ma", "ichimoku", "fvg", "ob", "sweep", "va_return", "va_break", "lvn", "ict")
 NAMES = {"ma": "moving averages 9/21", "ichimoku": "Ichimoku cloud", "fvg": "fair value gap",
-         "ob": "order block", "sweep": "liquidity sweep", "random": "random entry"}
+         "ob": "order block", "sweep": "liquidity sweep", "va_return": "back into value area",
+         "va_break": "accepted outside value area", "lvn": "through a low volume node",
+         "ict": "ICT: sweep, then FVG, 9:30-11:00", "random": "random entry"}
+PROFILE_BINS, VALUE_AREA = 50, 0.70
+KILLZONE = 17                         # bars: 9:30 to 11:00, the New York open
 SEED = 7
 
 
@@ -247,7 +251,100 @@ def sig_sweep(X, base, D, prev):
             yield k, -1
 
 
-GENERATORS = {"ma": sig_ma, "ichimoku": sig_ichimoku, "fvg": sig_fvg, "ob": sig_ob, "sweep": sig_sweep}
+# ---------------------------------------------------------------- phase 2: yesterday's volume profile, ICT
+
+def profile(D):
+    """The session's volume profile on 50 price bins (each bar's volume spread evenly
+    over its range): the point of control, the value area (70 % of the volume around
+    it) and the thinnest bin between the POC and each edge (the low volume nodes)."""
+    lo, hi = min(b["l"] for b in D), max(b["h"] for b in D)
+    step = max((hi - lo) / PROFILE_BINS, 0.01)
+    n = int((hi - lo) / step) + 1
+    vol = [0.0] * n
+    for b in D:
+        a, z = int((b["l"] - lo) / step), min(n - 1, int((b["h"] - lo) / step))
+        for i in range(a, z + 1):
+            vol[i] += (b.get("v") or 0) / (z - a + 1)
+    price = lambda i: lo + (i + 0.5) * step  # noqa: E731
+    poc = max(range(n), key=lambda i: vol[i])
+    i = j = poc
+    acc, total = vol[poc], sum(vol)
+    while acc < VALUE_AREA * total and (i > 0 or j < n - 1):
+        down = vol[i - 1] if i > 0 else -1
+        up = vol[j + 1] if j < n - 1 else -1
+        if up >= down:
+            j += 1
+            acc += vol[j]
+        else:
+            i -= 1
+            acc += vol[i]
+
+    def thinnest(a, z):
+        inside = range(a + 1, z)
+        return price(min(inside, key=lambda k: vol[k])) if len(inside) else None
+    return {"poc": price(poc), "val": price(i), "vah": price(j), "lvn_up": thinnest(poc, j), "lvn_dn": thinnest(i, poc)}
+
+
+def sig_va_return(X, base, D, prev):
+    """Opened outside yesterday's value area, then a close back inside: toward the POC."""
+    p = profile(prev)
+    o = D[0]["o"]
+    if p["val"] <= o <= p["vah"]:
+        return
+    for k in range(FIRST, LAST_ENTRY + 1):
+        if p["val"] <= D[k]["c"] <= p["vah"]:
+            yield k, 1 if o < p["val"] else -1
+            return
+
+
+def sig_va_break(X, base, D, prev):
+    """Opened inside yesterday's value area, then two closes in a row outside it: that way."""
+    p = profile(prev)
+    if not p["val"] <= D[0]["o"] <= p["vah"]:
+        return
+    for k in range(FIRST, LAST_ENTRY + 1):
+        if D[k]["c"] > p["vah"] and D[k - 1]["c"] > p["vah"]:
+            yield k, 1
+        elif D[k]["c"] < p["val"] and D[k - 1]["c"] < p["val"]:
+            yield k, -1
+
+
+def sig_lvn(X, base, D, prev):
+    """A close through one of yesterday's low volume nodes: price tends to travel fast there."""
+    p = profile(prev)
+    for k in range(FIRST, LAST_ENTRY + 1):
+        a, b = D[k - 1]["c"], D[k]["c"]
+        for lvn in (p["lvn_up"], p["lvn_dn"]):
+            if lvn is None:
+                continue
+            if a < lvn <= b:
+                yield k, 1
+            elif a > lvn >= b:
+                yield k, -1
+
+
+def sig_ict(X, base, D, prev):
+    """In the New York open killzone: yesterday's low (high) is swept, then a fair value
+    gap opens the other way; the entry is the first return into that gap."""
+    pdh, pdl = max(b["h"] for b in prev), min(b["l"] for b in prev)
+    swept = {1: None, -1: None}
+
+    def zones_at(j):
+        if j > KILLZONE:
+            return
+        if swept[1] is None and D[j]["l"] < pdl:
+            swept[1] = j
+        if swept[-1] is None and D[j]["h"] > pdh:
+            swept[-1] = j
+        if j >= 2 and swept[1] is not None and swept[1] < j and D[j]["l"] > D[j - 2]["h"]:
+            yield 1, D[j - 2]["h"], D[j]["l"], j
+        if j >= 2 and swept[-1] is not None and swept[-1] < j and D[j]["h"] < D[j - 2]["l"]:
+            yield -1, D[j]["h"], D[j - 2]["l"], j
+    return zone_entries(D, zones_at)
+
+
+GENERATORS = {"ma": sig_ma, "ichimoku": sig_ichimoku, "fvg": sig_fvg, "ob": sig_ob, "sweep": sig_sweep,
+              "va_return": sig_va_return, "va_break": sig_va_break, "lvn": sig_lvn, "ict": sig_ict}
 
 
 # ---------------------------------------------------------------- one trade
@@ -280,15 +377,16 @@ def trade(D, k, side, risk_atr, target_r, costs):
 
 # ---------------------------------------------------------------- the lab
 
-def variants():
-    return [(s, ctx) for ctx in (False, True) for s in SIGNALS + ("random",)]
+def variants(signals=SIGNALS):
+    return [(s, ctx) for ctx in (False, True) for s in tuple(signals) + ("random",)]
 
 
-def run_symbol(sym, sessions, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WARMUP, seed=SEED):
+def run_symbol(sym, sessions, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WARMUP, seed=SEED,
+               signals=SIGNALS):
     """Every variant's trades on one stock, and the contexts of the tested days."""
     X = indicators(sessions)
     rng = random.Random("%s-%s" % (seed, sym))
-    out = {v: [] for v in variants()}
+    out = {v: [] for v in variants(signals)}
     days = []
     for i in range(max(1, warmup), len(sessions)):
         d, D = sessions[i]
@@ -297,7 +395,7 @@ def run_symbol(sym, sessions, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmu
         base = i * tm.SESSION_BARS
         prev = sessions[i - 1][1]
         rk, rs = rng.randint(FIRST, LAST_ENTRY), rng.choice((1, -1))
-        for name in SIGNALS + ("random",):
+        for name in tuple(signals) + ("random",):
             fired = [(rk, rs)] if name == "random" else list(GENERATORS[name](X, base, D, prev))
             for with_ctx in (False, True):
                 if with_ctx:
@@ -331,8 +429,9 @@ def stats(trades, cut):
     return st
 
 
-def lab(charts, now_utc, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WARMUP, seed=SEED):
-    every = {v: [] for v in variants()}
+def lab(charts, now_utc, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WARMUP, seed=SEED,
+        signals=SIGNALS):
+    every = {v: [] for v in variants(signals)}
     days, per, failed = [], {}, {}
     for sym, text in charts.items():
         try:
@@ -343,7 +442,7 @@ def lab(charts, now_utc, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WAR
         if len(sessions) <= warmup:
             failed[sym] = "%d full sessions: the context needs more than %d" % (len(sessions), warmup)
             continue
-        out, ds = run_symbol(sym, sessions, costs, target_r, stop_atr, warmup, seed)
+        out, ds = run_symbol(sym, sessions, costs, target_r, stop_atr, warmup, seed, signals)
         for v in out:
             every[v] += out[v]
         days += [dict(x, symbol=sym) for x in ds]
@@ -352,7 +451,7 @@ def lab(charts, now_utc, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WAR
         raise tm.TMError("no stock had enough history: " + "; ".join("%s: %s" % kv for kv in failed.items()))
     cut = split_date([x["date"] for x in days])
     rows = []
-    for name, with_ctx in variants():
+    for name, with_ctx in variants(signals):
         st = stats(every[(name, with_ctx)], cut)
         rows.append({"signal": name, "context": with_ctx, "stats": st})
     base = {r["context"]: r["stats"] for r in rows if r["signal"] == "random"}
@@ -367,7 +466,7 @@ def lab(charts, now_utc, costs, target_r=TARGET_R, stop_atr=STOP_ATR, warmup=WAR
 
 
 def lab_report(doc):
-    out = ["Confluence lab, phase 1: %d stocks, %s, stop %g ATR, target %gR, out at 15:55."
+    out = ["Confluence lab: %d stocks, %s, stop %g ATR, target %gR, out at 15:55."
            % (len(doc["symbols"]), tm.cost_words(doc["costs"]), doc["stop_atr"], doc["target_r"]),
            "Year 1 = before %s, year 2 = from it. Context days: %d buys only, %d sells only, %d no bias."
            % (doc["split"], doc["bias_days"]["buy"], doc["bias_days"]["sell"], doc["bias_days"]["none"]), ""]
@@ -392,8 +491,8 @@ def lab_report(doc):
         out.append("")
     keep = ["%s%s" % (NAMES[r["signal"]], " + context" if r["context"] else "") for r in doc["rows"] if r["beats_random"]]
     out.append("Beat random in both years: %s." % (", ".join(keep) if keep else "none"))
-    out.append("R after costs. 12 variants on the same data: a YES is a candidate for phase 4, not an edge. "
-               "An edge needs its own 95 % range above zero too.")
+    out.append("R after costs. %d variants on the same data: a YES is a candidate for phase 4, not an edge. "
+               "An edge needs its own 95 %% range above zero too." % len(doc["rows"]))
     if doc["failed"]:
         out.append("Skipped: " + "; ".join("%s (%s)" % kv for kv in sorted(doc["failed"].items())))
     out.append("Education and tooling, not financial advice. Nothing here places an order.")
@@ -424,7 +523,13 @@ def cmd_backtest(a):
         raise tm.TMError("the lab needs years of bars: use --offline with a folder that backtest --save wrote, "
                          "or set TRADER_ALPACA_KEY and TRADER_ALPACA_SECRET")
     charts, failed = load_charts(a, a.range)
-    doc = lab(charts, tm.parse_now(a.now), tm.load_costs(a), a.target_r, a.stop_atr, a.warmup, a.seed)
+    signals = SIGNALS
+    if a.signals:
+        signals = tuple(x.strip() for x in a.signals.split(",") if x.strip())
+        bad = [x for x in signals if x not in GENERATORS]
+        if bad or not signals:
+            raise tm.TMError("unknown signal %s: pick from %s" % (", ".join(bad) or "(none)", ", ".join(SIGNALS)))
+    doc = lab(charts, tm.parse_now(a.now), tm.load_costs(a), a.target_r, a.stop_atr, a.warmup, a.seed, signals)
     doc["failed"].update(failed)
     if a.json:
         print(json.dumps(doc, indent=2))
@@ -484,6 +589,7 @@ def main(argv=None):
             p.add_argument("--commission", type=float, help="commission a share a side in $ (default %g)" % tm.COMMISSION)
             p.add_argument("--config", default="trader/config.json", help="costs from here when the flags are not given")
             p.add_argument("--warmup", type=int, default=WARMUP, help="sessions read before the first tested day (%d)" % WARMUP)
+            p.add_argument("--signals", help="only these, comma separated (default all): " + ",".join(SIGNALS))
             p.add_argument("--seed", type=int, default=SEED, help="seed of the random entries (%d)" % SEED)
     a = ap.parse_args(argv)
     if not a.cmd:
