@@ -207,5 +207,12 @@ class Universe(unittest.TestCase):
         self.assertEqual(doc["inactive_now"], ["GONE"])
 
 
+class Gaps(unittest.TestCase):
+    def test_a_reused_ticker_is_cut_at_the_hole(self):
+        B = [day("2019-08-07", 1, 1, 1, 1), day("2019-08-08", 1, 1, 1, 1), day("2026-02-12", 9, 9, 9, 9)]
+        self.assertEqual([b["d"] for b in sw.first_run(B)], ["2019-08-07", "2019-08-08"])
+        self.assertEqual(sw.first_run(B[:2]), B[:2])
+
+
 if __name__ == "__main__":
     unittest.main()
