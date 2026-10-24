@@ -209,6 +209,13 @@ alone and with the daily trend, against random entries: in at the next open, sto
 2 ATR(14), target 2R, out after 10 days. `swing.py engine` counts the agreeing
 signals over 3 days, picks the level on the first half and judges it on the
 second. Shorts pay no borrow fee in the test; say so.
+`--side buy` keeps the buys only. Stocks picked today carry hindsight (the
+ones that failed are missing): `swing.py universe --year 2016 --top 100` picks the
+most traded stocks of 2016 from Alpaca's whole asset list, delisted ones included,
+with 2016 data only; download and test those. For the evening routine, `swing.py
+live --ibkr <dir> --date <today> --journal <file>` adds one shadow buy proposal a
+stock when the engine's votes reach `--level` (2) on today's daily bar, and
+`swing.py review` closes them at the stop, the target or after 10 days.
 
 **Shadow signals (`confluence.py live-context`, `live`, `live-review`).**
 Phase 6, for the daily routines. Before the open, `live-context --ibkr <dir>`

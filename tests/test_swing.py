@@ -136,5 +136,76 @@ class Lab(unittest.TestCase):
         self.assertIn("BBB    no daily bars", out)
 
 
+def ibkr_file(path, B):
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump({"time": [b["d"] + "T13:30:00Z" for b in B], "open": [b["o"] for b in B],
+                   "high": [b["h"] for b in B], "low": [b["l"] for b in B], "close": [b["c"] for b in B],
+                   "volume": [b["v"] for b in B]}, fh)
+
+
+class Live(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp()
+        self.B = walk(150, seed=3)
+        ibkr_file(os.path.join(self.d, "AAA-daily.json"), self.B)
+        self.j = os.path.join(self.d, "diario-swing.json")
+
+    def tearDown(self):
+        shutil.rmtree(self.d)
+
+    def test_live_proposes_once_and_review_closes_it(self):
+        day = self.B[103]["d"]                                    # 2 buy votes against 1 here
+        code, out, err = run(["live", "--ibkr", self.d, "--symbols", "AAA", "--date", day, "--journal", self.j,
+                              "--level", "0"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Shadow only: nothing was ordered.", out)
+        self.assertGreater(*sw.live_votes(self.B[:104])[:2])
+        j = sw.cf.read_journal(self.j)
+        self.assertEqual((len(j), j[0]["status"], j[0]["signal_date"]), (1, "open", day))
+        self.assertIn("PROPOSAL buy", out)
+        run(["live", "--ibkr", self.d, "--symbols", "AAA", "--date", day, "--journal", self.j, "--level", "0"])
+        self.assertEqual(len(sw.cf.read_journal(self.j)), 1)              # one open trade a stock
+        code, out, err = run(["review", "--ibkr", self.d, "--journal", self.j, "--config", "none.json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sw.cf.read_journal(self.j)[0]["status"], "closed")       # 46 more days: it ended
+        self.assertIn("1 closed, 0 still open", out)
+        code, out, _ = run(["live", "--ibkr", self.d, "--symbols", "AAA", "--date", "2030-01-01", "--journal", self.j])
+        self.assertIn("no daily bar for 2030-01-01", out)
+
+    def test_review_keeps_a_young_trade_open(self):
+        B = [day("2026-01-%02d" % (k + 1), 100, 101, 99, 100) for k in range(5)]
+        j = {"symbol": "AAA", "signal_date": "2026-01-03", "atr": 1.0, "status": "open"}
+        out = sw.review_entry(j, B, {})
+        self.assertEqual((out["status"], out["entry"], out["stop"], out["days"]), ("open", 100, 98, 2))
+        B[4] = day("2026-01-05", 100, 101, 97, 98)
+        out = sw.review_entry(j, B, {})
+        self.assertEqual((out["status"], out["outcome"], out["R_net"]), ("closed", "stop", -1.0))
+
+    def test_side_filter(self):
+        out, _, _ = sw.run_symbol("AAA", self.B, {}, sides=(1,))
+        self.assertTrue(all(t["side"] == "buy" for v in out.values() for t in v))
+
+
+class Universe(unittest.TestCase):
+    def test_picks_by_that_years_dollar_volume_and_keeps_delisted(self):
+        gm = sw.tm.sys.modules.get("gamma") or __import__("gamma")
+        assets = {"active": [{"symbol": "BIG", "exchange": "NASDAQ", "name": "Big Inc", "status": "active"},
+                             {"symbol": "SPYX", "exchange": "NYSE", "name": "Some ETF Trust", "status": "active"},
+                             {"symbol": "PENNY", "exchange": "NYSE", "name": "Penny Co", "status": "active"}],
+                  "inactive": [{"symbol": "GONE", "exchange": "NYSE", "name": "Gone Corp", "status": "inactive"}]}
+        def bars(syms, tf, start, end, feed):
+            rows = lambda c, v: [{"c": c, "v": v}] * 250  # noqa: E731
+            return {"BIG": rows(100, 1e6), "GONE": rows(50, 3e6), "PENNY": rows(2, 1e9), "SPYX": rows(400, 1e9)}
+        saved = gm._get_trading, sw.ad._bars
+        gm._get_trading = lambda path, params: assets[params["status"]]
+        sw.ad._bars = bars
+        try:
+            doc = sw.universe(2016, 10)
+        finally:
+            gm._get_trading, sw.ad._bars = saved
+        self.assertEqual(doc["hits"], ["GONE", "BIG"])          # funds and penny stocks left out
+        self.assertEqual(doc["inactive_now"], ["GONE"])
+
+
 if __name__ == "__main__":
     unittest.main()
