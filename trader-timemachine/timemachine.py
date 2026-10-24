@@ -1433,7 +1433,7 @@ def main(argv=None):
     p.add_argument("--watchlist", default="trader/watchlist.json")
     p.add_argument("--or-minutes", type=int, default=15)
     p.add_argument("--stop-rule", default="or_mid", choices=["or_mid", "or_low", "pct"])
-    p.add_argument("--stop-pct", type=float, help="with --stop-rule pct: the stop, in % under the entry")
+    p.add_argument("--stop-pct", type=float, help="with --stop-rule pct: the stop, in %% under the entry")
     p.add_argument("--target-r", type=float, default=1.0)
     p.add_argument("--until", help="out by this time (default 16:00); your flat-by, e.g. 15:55")
     p.add_argument("--max-loss", type=float, help="$ risked a trade, to show R in dollars "
