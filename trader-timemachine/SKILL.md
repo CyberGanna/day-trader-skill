@@ -199,6 +199,17 @@ There is no free history of open interest, so gamma is a live filter only and
 the shadow journal judges it. The order book (level 2) needs paid data and is
 not in this skill.
 
+**The swing lab (`swing.py`).** The same ideas on daily bars, held for days:
+`swing.py download --symbols ... --years 10 --out giornaliero` reads split-adjusted
+daily bars from Alpaca (GET only); `swing.py backtest --symbols ... --daily
+giornaliero` (or `--offline storico`, daily bars built from the 5-minute files)
+tests an EMA 20/50 cross, an Ichimoku cloud break, a 20-day breakout, a pullback
+in trend (RSI 2), fair value gap and order block retests and a 20-day sweep,
+alone and with the daily trend, against random entries: in at the next open, stop
+2 ATR(14), target 2R, out after 10 days. `swing.py engine` counts the agreeing
+signals over 3 days, picks the level on the first half and judges it on the
+second. Shorts pay no borrow fee in the test; say so.
+
 **Shadow signals (`confluence.py live-context`, `live`, `live-review`).**
 Phase 6, for the daily routines. Before the open, `live-context --ibkr <dir>`
 reads each stock's daily (70 bars) and hourly (a month) bars saved from the
