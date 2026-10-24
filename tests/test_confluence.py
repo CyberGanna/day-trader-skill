@@ -175,3 +175,117 @@ class Cli(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class Engine(unittest.TestCase):
+    def test_a_vote_lasts_six_bars(self):
+        ev = {"fvg": [(5, 1), (20, -1)], "ma": []}
+        self.assertEqual(cf.votes_at(ev, 5), {"fvg": 1, "ma": 0})
+        self.assertEqual(cf.votes_at(ev, 10), {"fvg": 1, "ma": 0})
+        self.assertEqual(cf.votes_at(ev, 11), {"fvg": 0, "ma": 0})
+        self.assertEqual(cf.votes_at(ev, 21), {"fvg": -1, "ma": 0})
+
+    def cand(self, k, R, **x):
+        feats = {f: 0 for f in cf.FEATURES}
+        feats.update(x)
+        return {"k": k, "x": feats, "trade": {"R_net": R, "date": "2026-01-01", "time": "10:00"}}
+
+    def test_weights_first_trades_and_the_gate(self):
+        good = [{"cands": [self.cand(5, 1.0, fvg=1), self.cand(6, -1.0, fvg=-1)]} for _ in range(40)]
+        w = cf.learn_weights(good)
+        self.assertEqual(w["fvg"], 1.0)                 # agrees: +1 against an average of 0
+        self.assertEqual(w["ma"], 0.0)                  # never agreed 30 times: no weight
+        day = {"cands": [self.cand(5, -1.0, fvg=1), self.cand(9, 2.0, fvg=1, ma=1)]}
+        self.assertEqual(cf.first_trades([day], lambda x: sum(x.values()), 2), [day["cands"][1]["trade"]])
+        self.assertFalse(cf.gate({"trades": 50, "ci95_net": [0.1, 0.3], "halves_R_net": [0.2, 0.2]}))
+        self.assertTrue(cf.gate({"trades": 150, "ci95_net": [0.01, 0.3], "halves_R_net": [0.1, 0.2]}))
+        self.assertFalse(cf.gate({"trades": 150, "ci95_net": [0.01, 0.3], "halves_R_net": [-0.1, 0.4]}))
+
+    def test_engine_on_the_fixture(self):
+        saved = cf.MIN_TRAIN
+        cf.MIN_TRAIN = 5
+        try:
+            code, out, err = run(["engine", "--symbols", "TSLA", "--offline", DIR, "--now", AFTER,
+                                  "--warmup", "20", "--config", "none.json"])
+        finally:
+            cf.MIN_TRAIN = saved
+        self.assertEqual(code, 0, err)
+        self.assertIn("Confluence engine (phase 4)", out)
+        self.assertIn("count of agreeing votes", out)
+        self.assertIn("Weights learned on year 1", out)
+
+
+def load_json(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def ibkr_doc(rows):
+    """Bars -> the IBKR connector's JSON shape (times in UTC)."""
+    return {"time": [r[0] for r in rows], "open": [r[1]["o"] for r in rows], "high": [r[1]["h"] for r in rows],
+            "low": [r[1]["l"] for r in rows], "close": [r[1]["c"] for r in rows], "volume": [r[1]["v"] for r in rows]}
+
+
+class Live(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.d = tempfile.mkdtemp()
+        text = cf.tm.read_offline(DIR, "TSLA")
+        self.sessions = cf.sessions_of(text, "TSLA", cf.tm.parse_now(AFTER))
+        self.today = self.sessions[-1][0]
+
+        def utc(date, minutes):
+            local = cf.datetime.datetime.fromisoformat(date) + cf.datetime.timedelta(minutes=9 * 60 + 30 + minutes)
+            return cf.tm.eastern_to_utc(local).strftime("%Y-%m-%dT%H:%M:%SZ")
+        daily = [(utc(d, 0), {"o": D[0]["o"], "h": max(b["h"] for b in D), "l": min(b["l"] for b in D),
+                              "c": D[-1]["c"], "v": 1}) for d, D in self.sessions]
+        hourly = []
+        for d, D in self.sessions:
+            for start, end in ((0, 6), (6, 18), (18, 30), (30, 42), (42, 54), (54, 66), (66, 78)):
+                g = D[start:end]
+                hourly.append((utc(d, 5 * start), {"o": g[0]["o"], "h": max(b["h"] for b in g),
+                                                   "l": min(b["l"] for b in g), "c": g[-1]["c"], "v": 1}))
+        five = [(utc(d, 5 * i), b) for d, D in self.sessions[-2:] for i, b in enumerate(D)]
+        five_live = five[:78 + 24]                                    # today until 11:30
+        for name, rows in (("daily", daily), ("1h", hourly), ("5m-live", five_live), ("5m", five)):
+            with open(os.path.join(self.d, "TSLA-%s.json" % name), "w") as fh:
+                json.dump(ibkr_doc(rows), fh)
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.d)
+
+    def test_context_from_ibkr_matches_the_lab(self):
+        rows = cf.ibkr_rows(os.path.join(self.d, "TSLA-daily.json"))
+        self.assertEqual(rows[-1]["date"], self.today)
+        c = cf.live_context(rows, cf.ibkr_rows(os.path.join(self.d, "TSLA-1h.json")), self.today)
+        lab = cf.context(self.sessions[:-1])
+        self.assertEqual(c["D"], lab["D"])                            # IBKR's hours (9:30, 10:00, ...) set H1 and H4
+        self.assertIn(c["bias"], (-1, 0, 1))
+
+    def test_live_then_review(self):
+        ctxf, jf = os.path.join(self.d, "ctx.json"), os.path.join(self.d, "proposte.json")
+        code, out, err = run(["live-context", "--ibkr", self.d, "--symbols", "TSLA", "--date", self.today, "--out", ctxf])
+        self.assertEqual(code, 0, err)
+        code, out, err = run(["live", "--ibkr", self.d, "--context", ctxf, "--symbols", "TSLA", "--level", "1",
+                              "--journal", jf])
+        self.assertEqual(code, 0, err)
+        self.assertIn("TSLA   at 11:30", out)
+        self.assertIn("Shadow only: nothing was ordered", out)
+        journal = load_json(jf)
+        self.assertEqual(len(journal), 1)
+        p = journal[0]
+        self.assertLessEqual(p["bar"], 23)                            # never a bar after the data
+        run(["live", "--ibkr", self.d, "--context", ctxf, "--symbols", "TSLA", "--level", "1", "--journal", jf])
+        self.assertEqual(len(load_json(jf)), 1)                 # one proposal a stock a day
+        code, out, err = run(["live-review", "--ibkr", self.d, "--journal", jf, "--date", self.today,
+                              "--config", "none.json"])
+        self.assertEqual(code, 0, err)
+        self.assertIn("Shadow journal: 1 proposals", out)
+        self.assertIn("result", load_json(jf)[0])
+
+    def test_live_day_never_reads_ahead(self):
+        rows = cf.ibkr_rows(os.path.join(self.d, "TSLA-5m-live.json"))
+        prev, D, last = cf.live_day(rows, self.today)
+        self.assertEqual(last, 23)
+        self.assertEqual(D[30]["h"], D[23]["c"])                      # padding is flat at the last close
